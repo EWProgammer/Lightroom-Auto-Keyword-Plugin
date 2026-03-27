@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+
+# Logs / temp
+*.log
+*.tmp
+*.swp
+*~
+
+# Lightroom scratch files
+LR Error.txt
+
+# Optional local backups (keep out of repo)
+BACKUP*.lrplugin/
+Backup*.lrplugin/
+
+# Local run logs
+log*.txt
