@@ -10,6 +10,7 @@ local LrPrefs = import 'LrPrefs'
 
 -- ===== SAFE CACHE =====
 local keywordCache = {}
+local keywordPathCache = {}
 
 local function trim(value)
     if value == nil then return nil end
@@ -23,13 +24,14 @@ local function getOrCreateKeyword(catalog, name, parent, key)
     if not catalog or not name then return nil end
     key = key or name
 
-    if keywordCache[key] then
-        return keywordCache[key]
+    if keywordPathCache[key] then
+        return keywordPathCache[key]
     end
 
     local kw = catalog:createKeyword(name, {}, false, parent, true)
     if kw then
-        keywordCache[key] = kw
+        keywordPathCache[key] = kw
+        keywordCache[string.lower(name)] = keywordCache[string.lower(name)] or kw
     end
     return kw
 end
@@ -71,6 +73,19 @@ end
 local function sanitizeHierarchyPath(value)
     local s = clean(value)
     if not s then return nil end
+
+    if s:find("\\", 1, true) and not s:find("^%a:[/\\]") and not s:find("|", 1, true) and not s:find(">", 1, true) and not s:find("<", 1, true) and not s:find("›", 1, true) then
+        local parts = {}
+        for part in s:gmatch("[^\\]+") do
+            local p = clean(part)
+            if p then
+                parts[#parts + 1] = p
+            end
+        end
+        if #parts > 1 then
+            return table.concat(parts, "|")
+        end
+    end
 
     -- Lightroom supports hierarchy entry with |, >, and <.
     -- For "dog < animal", reverse into "animal|dog".
@@ -118,7 +133,27 @@ local LOCAL_AI_ENABLED = true
 -- Example:
 --   /usr/local/bin/keyword-ai --image %IMAGE_PATH% --history %HISTORY_FILE% --out %OUTPUT_FILE%
 local LOCAL_AI_COMMAND = ''
-local IS_WINDOWS = package and package.config and package.config:sub(1, 1) == "\\"
+
+local function detectWindows()
+    local windir = os.getenv and os.getenv("WINDIR")
+    if clean(windir) then
+        return true
+    end
+
+    local osName = os.getenv and os.getenv("OS")
+    if osName == "Windows_NT" then
+        return true
+    end
+
+    local pluginPath = _PLUGIN and _PLUGIN.path or ""
+    if type(pluginPath) == "string" and (pluginPath:match("^%a:[/\\]") or pluginPath:find("\\", 1, true)) then
+        return true
+    end
+
+    return package and package.config and package.config:sub(1, 1) == "\\" or false
+end
+
+local IS_WINDOWS = detectWindows()
 local AI_MAX_PHOTOS_PER_RUN = 10
 local AI_COOLDOWN_SECONDS = 0.2
 local AI_DEFAULT_SUGGESTIONS_PER_IMAGE = 10
@@ -144,19 +179,21 @@ local function commandQuote(value)
     return shellQuotePosix(value)
 end
 
-local function resolveLocalAiCommand()
+local function resolveLocalAiCommands()
     local configured = clean(LOCAL_AI_COMMAND)
     if configured then
-        return configured
+        return { configured }
     end
 
     if _PLUGIN and _PLUGIN.path then
         if IS_WINDOWS then
             local bridgePath = LrPathUtils.child(_PLUGIN.path, "OllamaKeywordBridge.cmd")
-            return 'cmd /C ""' .. bridgePath .. '" %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%""'
+            return {
+                '"' .. bridgePath .. '" %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%',
+            }
         else
             local bridgePath = LrPathUtils.child(_PLUGIN.path, "OllamaKeywordBridge.sh")
-            return "/bin/zsh " .. shellQuotePosix(bridgePath) .. " %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%"
+            return { "/bin/zsh " .. shellQuotePosix(bridgePath) .. " %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%" }
         end
     end
 
@@ -177,6 +214,14 @@ local function writeTextFile(path, text)
     return true
 end
 
+local function writeBinaryFile(path, data)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(data)
+    f:close()
+    return true
+end
+
 local function readTextFile(path)
     local f = io.open(path, "r")
     if not f then return "" end
@@ -187,6 +232,14 @@ end
 
 local function deleteFile(path)
     pcall(function() os.remove(path) end)
+end
+
+local function appendTextFile(path, text)
+    local f = io.open(path, "a")
+    if not f then return false end
+    f:write(tostring(text or ""))
+    f:close()
+    return true
 end
 
 local function parseAiKeywordOutput(text)
@@ -205,50 +258,133 @@ local function parseAiKeywordOutput(text)
     return words
 end
 
+local function buildLocalAiNoOutputMessage()
+    if IS_WINDOWS then
+        return "Local AI returned no keywords. Verify Ollama is installed, the Ollama app is running, and a vision model is available (for example llava:latest)."
+    end
+    return "Local AI returned no keywords. Verify Ollama is installed, running, and a vision model is available (for example llava:latest)."
+end
+
+local function renderAiThumbnail(photo)
+    if not photo then
+        return nil, "Missing photo"
+    end
+
+    local request = nil
+    local jpegData = nil
+    local thumbError = nil
+    local completed = false
+
+    request = photo:requestJpegThumbnail(1024, 1024, function(data, err)
+        jpegData = data
+        thumbError = err
+        completed = true
+    end)
+
+    local attempts = 0
+    while not completed and attempts < 400 do
+        LrTasks.sleep(0.05)
+        attempts = attempts + 1
+    end
+
+    request = nil
+
+    if not completed then
+        return nil, "Timed out waiting for Lightroom preview"
+    end
+
+    if not jpegData then
+        return nil, thumbError or "Failed to render Lightroom preview"
+    end
+
+    local thumbnailPath = uniqueTempPath('lrkw_ai_thumb', '.jpg')
+    if not writeBinaryFile(thumbnailPath, jpegData) then
+        return nil, "Failed to create temp JPEG preview for AI"
+    end
+
+    return thumbnailPath, nil
+end
+
 local LocalAiSuggester = {}
 
 function LocalAiSuggester.isConfigured()
-    return LOCAL_AI_ENABLED and resolveLocalAiCommand() ~= nil
+    return LOCAL_AI_ENABLED and resolveLocalAiCommands() ~= nil
 end
 
-function LocalAiSuggester.suggest(photoPath, historyText, maxSuggestions)
+function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
     if not LocalAiSuggester.isConfigured() then
         return {}, 'Local AI disabled (set LOCAL_AI_ENABLED and LOCAL_AI_COMMAND in KeywordRunner.lua)'
     end
 
-    local imagePath = clean(photoPath)
+    local imagePath = nil
+    local imageCleanupPath = nil
+    local imageError = nil
+
+    if type(photoOrPath) == "string" then
+        imagePath = clean(photoOrPath)
+    else
+        imagePath, imageError = renderAiThumbnail(photoOrPath)
+        imageCleanupPath = imagePath
+    end
+
     if not imagePath then
-        return {}, 'Missing image path'
+        return {}, imageError or 'Missing image path'
     end
 
     local historyFile = uniqueTempPath('lrkw_history', '.txt')
     local outputFile = uniqueTempPath('lrkw_ai_output', '.txt')
+    local debugFile = uniqueTempPath('lrkw_ai_debug', '.log')
+    appendTextFile(debugFile, "IS_WINDOWS: " .. tostring(IS_WINDOWS) .. "\n")
+    appendTextFile(debugFile, "PLUGIN_PATH: " .. tostring(_PLUGIN and _PLUGIN.path or "") .. "\n\n")
     if not writeTextFile(historyFile, tostring(historyText or '')) then
         return {}, "Failed to create temp history file for AI"
     end
 
-    local cmd = resolveLocalAiCommand() or ""
+    local commandTemplates = resolveLocalAiCommands() or {}
     local desiredCount = tonumber(maxSuggestions or AI_DEFAULT_SUGGESTIONS_PER_IMAGE) or AI_DEFAULT_SUGGESTIONS_PER_IMAGE
     desiredCount = math.max(1, math.min(30, math.floor(desiredCount)))
-    cmd = cmd:gsub('%%IMAGE_PATH%%', commandQuote(imagePath))
-    cmd = cmd:gsub('%%HISTORY_FILE%%', commandQuote(historyFile))
-    cmd = cmd:gsub('%%OUTPUT_FILE%%', commandQuote(outputFile))
-    cmd = cmd:gsub('%%MAX_SUGGESTIONS%%', tostring(desiredCount))
+    local exitCode = nil
+    for _, template in ipairs(commandTemplates) do
+        local cmd = template
+        cmd = cmd:gsub('%%IMAGE_PATH%%', commandQuote(imagePath))
+        cmd = cmd:gsub('%%HISTORY_FILE%%', commandQuote(historyFile))
+        cmd = cmd:gsub('%%OUTPUT_FILE%%', commandQuote(outputFile))
+        cmd = cmd:gsub('%%MAX_SUGGESTIONS%%', tostring(desiredCount))
+        local candidates = { cmd }
+        if IS_WINDOWS then
+            candidates = { '"' .. cmd .. '"', cmd }
+        end
 
-    local exitCode = LrTasks.execute(cmd)
+        for _, candidate in ipairs(candidates) do
+            appendTextFile(debugFile, "COMMAND: " .. tostring(candidate) .. "\n")
+            exitCode = LrTasks.execute(candidate)
+            appendTextFile(debugFile, "EXIT: " .. tostring(exitCode) .. "\n\n")
+            if exitCode == 0 then
+                break
+            end
+        end
+
+        if exitCode == 0 then
+            break
+        end
+    end
+
     if exitCode ~= 0 then
+        deleteFile(imageCleanupPath)
         deleteFile(historyFile)
         deleteFile(outputFile)
-        return {}, 'Local AI command failed with exit code ' .. tostring(exitCode)
+        return {}, 'Local AI command failed with exit code ' .. tostring(exitCode) .. '. Debug log: ' .. tostring(debugFile)
     end
 
     local outputText = readTextFile(outputFile)
 
+    deleteFile(imageCleanupPath)
     deleteFile(historyFile)
     deleteFile(outputFile)
 
     if clean(outputText) == nil then
-        return {}, "Local AI returned no keywords"
+        deleteFile(debugFile)
+        return {}, buildLocalAiNoOutputMessage()
     end
 
     local parsed = parseAiKeywordOutput(outputText)
@@ -261,6 +397,7 @@ function LocalAiSuggester.suggest(photoPath, historyText, maxSuggestions)
         parsed = limited
     end
 
+    deleteFile(debugFile)
     return parsed, nil
 end
 
@@ -528,7 +665,7 @@ local function buildExistingKeywordIndex(catalog)
 
     local allKeywords = catalog:getKeywords() or {}
     for _, keyword in ipairs(allKeywords) do
-            local name = clean(safeKeywordCall(keyword, "getName"))
+        local name = clean(safeKeywordCall(keyword, "getName"))
         if name then
             local fullPath = sanitizeHierarchyPath(safeKeywordCall(keyword, "getNameViaHierarchy"))
 
@@ -549,6 +686,12 @@ local function buildExistingKeywordIndex(catalog)
             local key = string.lower(name)
             if not index[key] then
                 index[key] = fullPath
+            end
+            if fullPath then
+                keywordPathCache[fullPath] = keyword
+            end
+            if not keywordCache[key] then
+                keywordCache[key] = keyword
             end
         end
     end
@@ -883,7 +1026,7 @@ LrTasks.startAsyncTask(function()
     if mode == "ai_local" and not LocalAiSuggester.isConfigured() then
         LrDialogs.message(
             "Local AI is not configured",
-            "Set LOCAL_AI_ENABLED=true in KeywordRunner.lua. LOCAL_AI_COMMAND is optional if using OllamaKeywordBridge.sh.",
+            "Set LOCAL_AI_ENABLED=true in KeywordRunner.lua. LOCAL_AI_COMMAND is optional if using the bundled Ollama bridge script.",
             "OK"
         )
         return
@@ -948,10 +1091,9 @@ LrTasks.startAsyncTask(function()
 
     for i, photo in ipairs(photos) do
         if mode == "ai_local" then
-            local photoPath = clean(photo and photo:getRawMetadata("path"))
             local aiErr = nil
             local aiKeywords = nil
-            aiKeywords, aiErr = LocalAiSuggester.suggest(photoPath, aiProfile, aiSettings and aiSettings.suggestionsPerImage)
+            aiKeywords, aiErr = LocalAiSuggester.suggest(photo, aiProfile, aiSettings and aiSettings.suggestionsPerImage)
             aiKeywordsByPhoto[i] = aiKeywords or {}
             if aiErr and not firstAiError then
                 firstAiError = aiErr
