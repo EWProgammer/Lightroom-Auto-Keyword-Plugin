@@ -2,7 +2,7 @@ return {
     LrSdkVersion = 6.0,
     LrToolkitIdentifier = "com.ericweist.aikeyword",
     LrPluginName = "AI Keyword Generator",
-    VERSION = { major=1, minor=2, revision=0, build=1 },
+    VERSION = { major=1, minor=3, revision=0, build=0 },
 
     LrLibraryMenuItems = {
         {
