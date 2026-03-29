@@ -21,7 +21,7 @@ tmp_file="$(mktemp)"
 awk '
   match($0, /VERSION = \{ major=([0-9]+), minor=([0-9]+), revision=([0-9]+), build=([0-9]+) \}/, m) {
     build = m[4] + 1
-    printf("    VERSION = { major=%d, minor=%d, revision=%d, build=%d }\n", m[1], m[2], m[3], build)
+    printf("    VERSION = { major=%d, minor=%d, revision=%d, build=%d },\n", m[1], m[2], m[3], build)
     next
   }
   { print }
