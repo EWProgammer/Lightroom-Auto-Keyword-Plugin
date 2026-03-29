@@ -29,6 +29,7 @@ local DEFAULT_BRANCH = "main"
 
 -- URL to fetch Info.lua file from GitHub
 local RAW_INFO_URL = "https://raw.githubusercontent.com/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/" .. DEFAULT_BRANCH .. "/AutoKeyword.lrplugin/Info.lua"
+local CONTENTS_INFO_URL = "https://api.github.com/repos/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/contents/AutoKeyword.lrplugin/Info.lua?ref=" .. DEFAULT_BRANCH
 
 -- URL to download entire branch as ZIP
 local BRANCH_ZIP_URL = "https://github.com/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/archive/refs/heads/" .. DEFAULT_BRANCH .. ".zip"
@@ -276,6 +277,72 @@ local function fetchText(url)
     return httpGet(url) or shellFetch(url)
 end
 
+local function decodeBase64(data)
+    local alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    data = tostring(data or ''):gsub('%s+', ''):gsub('[^' .. alphabet .. '=]', '')
+
+    return (data:gsub('.', function(char)
+        if char == '=' then
+            return ''
+        end
+
+        local index = alphabet:find(char, 1, true)
+        if not index then
+            return ''
+        end
+
+        local value = index - 1
+        local bits = ''
+        for i = 6, 1, -1 do
+            bits = bits .. ((value % 2 ^ i - value % 2 ^ (i - 1) > 0) and '1' or '0')
+        end
+        return bits
+    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(byte)
+        if #byte ~= 8 then
+            return ''
+        end
+
+        local value = 0
+        for i = 1, 8 do
+            if byte:sub(i, i) == '1' then
+                value = value + 2 ^ (8 - i)
+            end
+        end
+        return string.char(value)
+    end))
+end
+
+local function extractContentFromGitHubContentsJson(jsonText)
+    local body = tostring(jsonText or "")
+    local encoded = body:match('"content"%s*:%s*"([^"]+)"')
+    if not encoded then
+        return nil
+    end
+
+    encoded = encoded:gsub("\\n", "")
+    local decoded = decodeBase64(encoded)
+    return trim(decoded)
+end
+
+local function fetchRemoteInfoText()
+    local cacheBust = tostring(os.time())
+    local rawUrl = RAW_INFO_URL .. "?t=" .. cacheBust
+    local rawText = fetchText(rawUrl)
+    local rawVersion = parseVersionFromInfoText(rawText)
+
+    local contentsText = extractContentFromGitHubContentsJson(fetchText(CONTENTS_INFO_URL))
+    local contentsVersion = parseVersionFromInfoText(contentsText)
+
+    if rawVersion and contentsVersion then
+        if compareVersions(rawVersion, contentsVersion) >= 0 then
+            return rawText
+        end
+        return contentsText
+    end
+
+    return rawText or contentsText
+end
+
 -- ============================================================================
 -- VERSION CHECKING
 -- Fetches and parses remote version info
@@ -314,7 +381,7 @@ end
 local function fetchUpdateInfo()
     local localInfo = readLocalPluginInfo()
     local localVersion = localInfo and localInfo.VERSION or nil
-    local remoteInfoText = fetchText(RAW_INFO_URL)
+    local remoteInfoText = fetchRemoteInfoText()
     if not remoteInfoText then
         return nil, "network"
     end
