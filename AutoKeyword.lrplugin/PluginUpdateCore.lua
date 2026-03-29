@@ -252,22 +252,44 @@ end
 local function shellFetch(url)
     local outputFile = uniqueTempPath("lrkw_update_fetch", ".txt")
     local command = nil
+    local isGitHubApi = tostring(url or ""):find("https://api.github.com/", 1, true) == 1
 
     if IS_WINDOWS then
         -- Use PowerShell for Windows
-        local psCommand = table.concat({
-            "$ProgressPreference='SilentlyContinue'; ",
-            "try { ",
-            "(Invoke-WebRequest -UseBasicParsing ",
-            commandQuote(url),
-            " -TimeoutSec 20).Content | Set-Content -Encoding UTF8 ",
-            commandQuote(outputFile),
-            " } catch { exit 1 }"
-        })
+        local psCommand = nil
+        if isGitHubApi then
+            psCommand = table.concat({
+                "$ProgressPreference='SilentlyContinue'; ",
+                "$headers=@{ 'Accept'='application/vnd.github+json'; 'User-Agent'='Lightroom-Auto-Keyword-Plugin-Updater' }; ",
+                "try { ",
+                "(Invoke-WebRequest -UseBasicParsing -Headers $headers ",
+                commandQuote(url),
+                " -TimeoutSec 20).Content | Set-Content -Encoding UTF8 ",
+                commandQuote(outputFile),
+                " } catch { exit 1 }"
+            })
+        else
+            psCommand = table.concat({
+                "$ProgressPreference='SilentlyContinue'; ",
+                "try { ",
+                "(Invoke-WebRequest -UseBasicParsing ",
+                commandQuote(url),
+                " -TimeoutSec 20).Content | Set-Content -Encoding UTF8 ",
+                commandQuote(outputFile),
+                " } catch { exit 1 }"
+            })
+        end
         command = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "' .. psCommand .. '"'
     else
         -- Use curl for macOS/Linux
-        command = '/bin/sh -lc "curl -fsSL ' .. shellQuotePosix(url) .. ' > ' .. shellQuotePosix(outputFile) .. '"'
+        if isGitHubApi then
+            command = '/bin/sh -lc "curl -fsSL -H ' ..
+                shellQuotePosix('Accept: application/vnd.github+json') .. ' -H ' ..
+                shellQuotePosix('User-Agent: Lightroom-Auto-Keyword-Plugin-Updater') .. ' ' ..
+                shellQuotePosix(url) .. ' > ' .. shellQuotePosix(outputFile) .. '"'
+        else
+            command = '/bin/sh -lc "curl -fsSL ' .. shellQuotePosix(url) .. ' > ' .. shellQuotePosix(outputFile) .. '"'
+        end
     end
 
     local exitCode = LrTasks.execute(command)

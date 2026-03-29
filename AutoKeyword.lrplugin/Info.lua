@@ -48,7 +48,7 @@ return {
     LrInitPlugin = "PluginInit.lua",
     
     -- Current plugin version (major.minor.revision.build format)
-    VERSION = { major=1, minor=4, revision=2, build=4 },
+    VERSION = { major=1, minor=4, revision=2, build=5 }
 
     -- Menu items added to Lightroom's Library module
     LrLibraryMenuItems = menuItems,
