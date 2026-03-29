@@ -15,6 +15,8 @@ local LrPathUtils = import 'LrPathUtils'
 local LrPrefs = import 'LrPrefs'
 local LrShell = import 'LrShell'
 local LrTasks = import 'LrTasks'
+local LrView = import 'LrView'
+local LrFunctionContext = import 'LrFunctionContext'
 
 -- ============================================================================
 -- GITHUB REPOSITORY CONFIGURATION
@@ -39,6 +41,7 @@ local RELEASES_URL = "https://github.com/" .. REPO_OWNER .. "/" .. REPO_NAME .. 
 
 -- GitHub API endpoint for latest release
 local GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/releases/latest"
+local GITHUB_API_RECENT_COMMITS = "https://api.github.com/repos/" .. REPO_OWNER .. "/" .. REPO_NAME .. "/commits?sha=" .. DEFAULT_BRANCH .. "&per_page=6"
 
 -- Get plugin preferences for tracking last check time
 local prefs = LrPrefs.prefsForPlugin()
@@ -367,6 +370,112 @@ local function extractLatestReleaseZipUrl(jsonText)
     return nil
 end
 
+local function decodeJsonString(value)
+    local text = tostring(value or "")
+    text = text:gsub('\\"', '"')
+    text = text:gsub("\\/", "/")
+    text = text:gsub("\\r\\n", "\n")
+    text = text:gsub("\\n", "\n")
+    text = text:gsub("\\r", "\n")
+    text = text:gsub("\\t", "\t")
+    text = text:gsub("\\u(%x%x%x%x)", function(hex)
+        local code = tonumber(hex, 16)
+        if not code then
+            return ""
+        end
+        if code < 128 then
+            return string.char(code)
+        end
+        return "?"
+    end)
+    return text
+end
+
+local function extractLatestReleaseNotes(jsonText)
+    local body = tostring(jsonText or "")
+    local releaseName = body:match('"name"%s*:%s*"([^"]*)"')
+    local releaseBody = body:match('"body"%s*:%s*"((?:\\"|[^"])*)"')
+
+    releaseName = trim(decodeJsonString(releaseName))
+    releaseBody = trim(decodeJsonString(releaseBody))
+
+    if not releaseBody then
+        return nil
+    end
+
+    if releaseName then
+        return releaseName .. "\n\n" .. releaseBody
+    end
+
+    return releaseBody
+end
+
+local function extractCommitNotes(jsonText)
+    local body = tostring(jsonText or "")
+    local notes = {}
+
+    for message in body:gmatch('"message"%s*:%s*"((?:\\"|[^"])*)"') do
+        local decoded = trim(decodeJsonString(message))
+        if decoded then
+            local firstLine = trim(decoded:match("([^\n\r]+)"))
+            if firstLine and not firstLine:match("^Merge ") then
+                notes[#notes + 1] = "- " .. firstLine
+            end
+        end
+        if #notes >= 5 then
+            break
+        end
+    end
+
+    if #notes == 0 then
+        return nil
+    end
+
+    return "Recent changes on " .. DEFAULT_BRANCH .. ":\n\n" .. table.concat(notes, "\n")
+end
+
+local function showUpdateDetailsDialog(info)
+    LrFunctionContext.callWithContext("pluginUpdateDetailsDialog", function(context)
+        local f = LrView.osFactory()
+        local contents = f:column {
+            spacing = 10,
+            f:static_text {
+                title = "Installed version: " .. tostring(info.localVersionText) .. "\nLatest version: " .. tostring(info.remoteVersionText),
+                width_in_chars = 84
+            },
+            f:static_text {
+                title = "What's new:",
+                width_in_chars = 20
+            },
+            f:scrolled_view {
+                width = 640,
+                height = 280,
+                horizontal_scroller = false,
+                vertical_scroller = true,
+                f:static_text {
+                    title = tostring(info.releaseNotes or "No release notes were available for this update."),
+                    width_in_chars = 86
+                }
+            },
+            f:static_text {
+                title = "Installing will open the download page for a fresh zip install. After downloading, unzip it and replace your current plugin folder in Lightroom.",
+                width_in_chars = 86
+            }
+        }
+
+        local result = LrDialogs.presentModalDialog {
+            title = "Plugin Update Available",
+            contents = contents,
+            actionVerb = "Open Download",
+            cancelVerb = "Later"
+        }
+
+        if result == "ok" then
+            openUrl(info.downloadUrl)
+        end
+    end)
+end
+
 --- Opens a URL in the default web browser
 -- @param url URL to open
 local function openUrl(url)
@@ -393,6 +502,11 @@ local function fetchUpdateInfo()
 
     local latestReleaseJson = fetchText(GITHUB_API_LATEST_RELEASE)
     local downloadUrl = extractLatestReleaseZipUrl(latestReleaseJson) or BRANCH_ZIP_URL
+    local releaseNotes = extractLatestReleaseNotes(latestReleaseJson)
+
+    if not releaseNotes then
+        releaseNotes = extractCommitNotes(fetchText(GITHUB_API_RECENT_COMMITS))
+    end
 
     return {
         localVersion = localVersion,
@@ -402,6 +516,7 @@ local function fetchUpdateInfo()
         comparison = compareVersions(localVersion, remoteVersion),
         downloadUrl = downloadUrl,
         releasesUrl = RELEASES_URL,
+        releaseNotes = releaseNotes,
     }, nil
 end
 
@@ -433,26 +548,7 @@ function UpdateCore.runManualCheck()
         return
     end
 
-    local result = LrDialogs.confirm(
-        "Plugin update available",
-        "Installed version: " .. info.localVersionText .. "\nLatest version on GitHub: " .. info.remoteVersionText .. "\n\nThis will open the download URL for a fresh zip install. After downloading, unzip it and replace your current plugin folder in Lightroom.",
-        "Open Download",
-        "Cancel"
-    )
-
-    if result == "ok" then
-        openUrl(info.downloadUrl)
-    else
-        local followup = LrDialogs.confirm(
-            "Open releases page instead?",
-            "If you prefer, the plugin can open the GitHub releases page so you can review release notes before downloading.",
-            "Open Releases",
-            "Done"
-        )
-        if followup == "ok" then
-            openUrl(info.releasesUrl)
-        end
-    end
+    showUpdateDetailsDialog(info)
 end
 
 function UpdateCore.runStartupAutoCheck()
@@ -489,3 +585,4 @@ function UpdateCore.runStartupAutoCheck()
 end
 
 return UpdateCore
+
