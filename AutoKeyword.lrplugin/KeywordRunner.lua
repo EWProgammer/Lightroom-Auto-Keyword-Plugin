@@ -1324,13 +1324,14 @@ local function promptUnknownKeywordCategories(unknownWords)
         for i, word in ipairs(sorted) do
             local key = "cat_" .. i
             props[key] = props.defaultCategory
-            categoryRows[#categoryRows + 1] = f:row {
-                spacing = 8,
-                f:static_text { title = word, width_in_chars = 35 },
+            categoryRows[#categoryRows + 1] = f:column {
+                spacing = 2,
+                f:static_text { title = "Proposed keyword: " .. word, width_in_chars = 72 },
                 f:edit_field {
                     value = LrView.bind(key),
-                    width_in_chars = 28
-                }
+                    width_in_chars = 44
+                },
+                f:separator { fill_horizontal = 1 }
             }
         end
 
@@ -1487,6 +1488,7 @@ local function collectKeywordPathsForPhoto(photo, mode, stylePaths, quickTags, a
 
     if data.dateInfo then
         addKeywordPath(paths, pathSet, "Date|" .. tostring(data.dateInfo.year) .. "|" .. tostring(data.dateInfo.monthName), attachedKeywordState)
+        addKeywordPath(paths, pathSet, "Month|" .. tostring(data.dateInfo.monthName), attachedKeywordState)
 
         local season = getSeason(data.dateInfo.monthNumber)
         if season then
