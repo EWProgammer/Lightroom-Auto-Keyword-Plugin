@@ -451,7 +451,7 @@ local function extractCommitNotes(jsonText)
         return nil
     end
 
-    return "Recent changes on " .. DEFAULT_BRANCH .. ":\n\n" .. table.concat(notes, "\n")
+    return "Recent commit messages on " .. DEFAULT_BRANCH .. ":\n\n" .. table.concat(notes, "\n")
 end
 
 local openUrl
@@ -547,7 +547,7 @@ local function showUpdateDetailsDialog(info)
                 horizontal_scroller = false,
                 vertical_scroller = true,
                 f:static_text {
-                    title = tostring(info.releaseNotes or "No release notes were available for this update."),
+                    title = tostring(info.releaseNotes or "Recent commit messages were not available for this update."),
                     width_in_chars = 86
                 }
             },
