@@ -16,6 +16,7 @@ local LrPrefs = import 'LrPrefs'
 local LrShell = import 'LrShell'
 local LrTasks = import 'LrTasks'
 local LrView = import 'LrView'
+local LrBinding = import 'LrBinding'
 local LrFunctionContext = import 'LrFunctionContext'
 
 -- ============================================================================
@@ -136,6 +137,14 @@ local function readTextFile(path)
     local content = f:read("*a") or ""
     f:close()
     return content
+end
+
+local function writeTextFile(path, text)
+    local f = io.open(path, "w")
+    if not f then return false end
+    f:write(tostring(text or ""))
+    f:close()
+    return true
 end
 
 --- Safely deletes a file
@@ -278,6 +287,17 @@ end
 -- @return Content string or nil if both methods fail
 local function fetchText(url)
     return httpGet(url) or shellFetch(url)
+end
+
+local function parseResultFile(path)
+    local values = {}
+    for line in tostring(readTextFile(path) or ""):gmatch("[^\r\n]+") do
+        local key, value = line:match("^([^=]+)=(.*)$")
+        if key then
+            values[key] = value
+        end
+    end
+    return values
 end
 
 local function decodeBase64(data)
@@ -434,6 +454,80 @@ local function extractCommitNotes(jsonText)
     return "Recent changes on " .. DEFAULT_BRANCH .. ":\n\n" .. table.concat(notes, "\n")
 end
 
+local openUrl
+
+local function showManualDownloadDialog(info, extraMessage)
+    LrFunctionContext.callWithContext("pluginManualDownloadDialog", function(context)
+        local f = LrView.osFactory()
+        local props = LrBinding.makePropertyTable and LrBinding.makePropertyTable(context) or {}
+        props.url = tostring(info.downloadUrl or "")
+
+        local contents = f:column {
+            bind_to_object = props,
+            spacing = 10,
+            f:static_text {
+                title = extraMessage or "Automatic installation was not available. Copy this link if you want to download the update manually:",
+                width_in_chars = 88
+            },
+            f:edit_field {
+                value = LrView.bind("url"),
+                width_in_chars = 92
+            }
+        }
+
+        local result = LrDialogs.presentModalDialog {
+            title = "Manual Update Link",
+            contents = contents,
+            actionVerb = "Open in Browser",
+            cancelVerb = "Close"
+        }
+
+        if result == "ok" then
+            openUrl(info.downloadUrl)
+        end
+    end)
+end
+
+local function installUpdatePackage(info)
+    local resultFile = uniqueTempPath("lrkw_update_result", ".txt")
+    writeTextFile(resultFile, "")
+
+    local command = nil
+    if IS_WINDOWS then
+        local scriptPath = LrPathUtils.child(_PLUGIN.path, "PluginSelfUpdate.ps1")
+        command = "powershell -NoProfile -ExecutionPolicy Bypass -File " ..
+            commandQuote(scriptPath) .. " " ..
+            commandQuote(info.downloadUrl) .. " " ..
+            commandQuote(_PLUGIN.path) .. " " ..
+            commandQuote(resultFile)
+    else
+        local scriptPath = LrPathUtils.child(_PLUGIN.path, "PluginSelfUpdate.sh")
+        command = "/bin/sh " ..
+            shellQuotePosix(scriptPath) .. " " ..
+            shellQuotePosix(info.downloadUrl) .. " " ..
+            shellQuotePosix(_PLUGIN.path) .. " " ..
+            shellQuotePosix(resultFile)
+    end
+
+    local exitCode = LrTasks.execute(command)
+    local result = parseResultFile(resultFile)
+    deleteFile(resultFile)
+
+    if exitCode == 0 and result.status == "ok" then
+        local backupPath = trim(result.backup)
+        local message = "The update was installed into the current plugin folder."
+        if backupPath then
+            message = message .. "\nBackup created at: " .. backupPath
+        end
+        message = message .. "\n\nReload the plugin or restart Lightroom to finish applying the update."
+        LrDialogs.message("Plugin updated", message, "OK")
+        return
+    end
+
+    local reason = trim(result.message) or "Automatic installation failed."
+    showManualDownloadDialog(info, reason .. "\n\nYou can still download the update manually here:")
+end
+
 local function showUpdateDetailsDialog(info)
     LrFunctionContext.callWithContext("pluginUpdateDetailsDialog", function(context)
         local f = LrView.osFactory()
@@ -458,7 +552,7 @@ local function showUpdateDetailsDialog(info)
                 }
             },
             f:static_text {
-                title = "Installing will open the download page for a fresh zip install. After downloading, unzip it and replace your current plugin folder in Lightroom.",
+                title = "Install Update downloads the package and replaces the plugin files in place. You will only need to reload the plugin or restart Lightroom afterward.",
                 width_in_chars = 86
             }
         }
@@ -466,19 +560,19 @@ local function showUpdateDetailsDialog(info)
         local result = LrDialogs.presentModalDialog {
             title = "Plugin Update Available",
             contents = contents,
-            actionVerb = "Open Download",
+            actionVerb = "Install Update",
             cancelVerb = "Later"
         }
 
         if result == "ok" then
-            openUrl(info.downloadUrl)
+            installUpdatePackage(info)
         end
     end)
 end
 
 --- Opens a URL in the default web browser
 -- @param url URL to open
-local function openUrl(url)
+openUrl = function(url)
     local ok = pcall(function()
         LrShell.openURLInBrowser(url)
     end)
@@ -574,15 +668,14 @@ function UpdateCore.runStartupAutoCheck()
 
     local result = LrDialogs.confirm(
         "Plugin update available",
-        "A newer plugin version is available.\nInstalled version: " .. info.localVersionText .. "\nLatest version on GitHub: " .. remoteVersionText .. "\n\nOpen the download page now?",
-        "Open Download",
+        "A newer plugin version is available.\nInstalled version: " .. info.localVersionText .. "\nLatest version on GitHub: " .. remoteVersionText .. "\n\nOpen the update details now?",
+        "View Update",
         "Later"
     )
 
     if result == "ok" then
-        openUrl(info.downloadUrl)
+        showUpdateDetailsDialog(info)
     end
 end
 
 return UpdateCore
-
