@@ -2,6 +2,7 @@ return {
     LrSdkVersion = 6.0,
     LrToolkitIdentifier = "com.ericweist.aikeyword",
     LrPluginName = "AI Keyword Generator",
+    LrInitPlugin = "PluginInit.lua",
     VERSION = { major=1, minor=3, revision=0, build=0 },
 
     LrLibraryMenuItems = {
@@ -17,6 +18,10 @@ return {
         {
             title = "Manage Local AI Runtime",
             file = "LocalAiRuntimeManager.lua",
+        },
+        {
+            title = "Check for Plugin Updates",
+            file = "PluginUpdater.lua",
         },
     },
 }
