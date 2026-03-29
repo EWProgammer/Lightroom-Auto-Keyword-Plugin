@@ -1,3 +1,14 @@
+-- ============================================================================
+-- LOCALAIRUNTIMEMANAGER.LUA
+-- Ollama Runtime Configuration and Management UI
+-- ============================================================================
+-- This module provides a dialog for managing the local AI (Ollama) runtime.
+-- Users can configure AI settings, see installation paths, manage models, and
+-- uninstall Ollama if needed. Platform-specific options are provided for
+-- Windows and macOS/Linux systems.
+-- ============================================================================
+
+-- Import Lightroom SDK libraries
 local LrTasks = import 'LrTasks'
 local LrDialogs = import 'LrDialogs'
 local LrView = import 'LrView'
@@ -5,8 +16,16 @@ local LrBinding = import 'LrBinding'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrPrefs = import 'LrPrefs'
 
+-- Get access to plugin preferences for saving settings
 local prefs = LrPrefs.prefsForPlugin()
 
+-- ============================================================================
+-- UTILITY FUNCTIONS
+-- ============================================================================
+
+--- Removes leading and trailing whitespace
+-- @param value String to trim
+-- @return Trimmed string or nil if empty
 local function trim(value)
     if value == nil then return nil end
     local s = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
@@ -14,6 +33,10 @@ local function trim(value)
     return s
 end
 
+--- Checks if a file path exists by attempting to open it
+-- Uses safe error handling to avoid crashing
+-- @param path File path to check
+-- @return Boolean: true if file exists, false otherwise
 local function pathExists(path)
     if not trim(path) then return false end
     local ok, result = pcall(function()
@@ -27,6 +50,9 @@ local function pathExists(path)
     return ok and result or false
 end
 
+--- Detects if running on Windows OS
+-- Checks environment variables and package configuration
+-- @return Boolean: true if running on Windows
 local function detectWindows()
     local windir = os.getenv and os.getenv("WINDIR")
     if trim(windir) then
@@ -41,12 +67,23 @@ local function detectWindows()
     return package and package.config and package.config:sub(1, 1) == "\\" or false
 end
 
+-- Detects OS once at module load
 local IS_WINDOWS = detectWindows()
+
+-- ============================================================================
+-- CONFIGURATION VALUES
+-- ============================================================================
+
+-- Default number of AI suggestions 
 local DEFAULT_SUGGESTIONS = 10
 local DEFAULT_MAX_PHOTOS = 10
+
+-- Conservative defaults for Mac systems (lower RAM)
 local MAC_SAFE_SUGGESTIONS = 6
 local MAC_SAFE_MAX_PHOTOS = 3
 
+--- Gets configured suggestions per image from preferences
+-- @return Number clamped to range 1-30
 local function getConfiguredSuggestionsPerImage()
     local n = tonumber(prefs.aiDefaultSuggestionsPerImage)
     if not n then
@@ -55,6 +92,8 @@ local function getConfiguredSuggestionsPerImage()
     return math.max(1, math.min(30, math.floor(n)))
 end
 
+--- Gets configured max photos per run from preferences
+-- @return Number clamped to range 1-200
 local function getConfiguredMaxPhotosPerRun()
     local n = tonumber(prefs.aiMaxPhotosPerRun)
     if not n then
@@ -63,6 +102,12 @@ local function getConfiguredMaxPhotosPerRun()
     return math.max(1, math.min(200, math.floor(n)))
 end
 
+-- ============================================================================
+-- PLATFORM-SPECIFIC PATH HELPERS
+-- ============================================================================
+
+--- Gets typical Ollama installation paths on Windows
+-- @return Table with installDir, uninstaller, and modelsDir paths
 local function getWindowsPaths()
     local localAppData = os.getenv and os.getenv("LOCALAPPDATA") or ""
     local homePath = os.getenv and os.getenv("USERPROFILE") or ""
@@ -76,6 +121,8 @@ local function getWindowsPaths()
     }
 end
 
+--- Gets typical Ollama installation paths on macOS/Linux
+-- @return Table with appPath, cliPath, altCliPath, and modelsDir paths
 local function getMacPaths()
     local homePath = os.getenv and os.getenv("HOME") or ""
     return {
@@ -86,6 +133,13 @@ local function getMacPaths()
     }
 end
 
+-- ============================================================================
+-- UNINSTALL HELPERS
+-- ============================================================================
+
+--- Launches the Windows Ollama uninstaller if found
+-- Confirms with user before executing
+-- @param uninstaller Path to unins000.exe
 local function launchWindowsUninstaller(uninstaller)
     if not pathExists(uninstaller) then
         LrDialogs.message("Ollama uninstaller not found", "Try Windows Settings > Apps > Installed apps > Ollama.", "OK")
@@ -104,6 +158,10 @@ local function launchWindowsUninstaller(uninstaller)
     end
 end
 
+--- Shows recommended manual uninstall steps for macOS
+-- Ollama on macOS doesn't have an automated uninstaller, so users must
+-- manually remove files following the official uninstall documentation
+-- @param paths Table with macOS Ollama paths
 local function showMacUninstallInstructions(paths)
     local lines = table.concat({
         "To fully remove Ollama on macOS, Ollama's official docs currently recommend removing these items:",
@@ -124,10 +182,21 @@ local function showMacUninstallInstructions(paths)
     LrDialogs.message("macOS Ollama Uninstall", lines, "OK")
 end
 
+-- ============================================================================
+-- MAIN DIALOG UI
+-- ============================================================================
+
+-- Start async task to avoid blocking Lightroom
 LrTasks.startAsyncTask(function()
+    -- Create dialog context
     LrFunctionContext.callWithContext("localAiRuntimeManagerDialog", function(context)
+        -- UI factory for creating controls
         local f = LrView.osFactory()
+        
+        -- Property table for two-way data binding
         local props = LrBinding.makePropertyTable(context)
+        
+        -- Initialize properties from preferences
         props.showStartupNotice = not not prefs.aiBootstrapNoticeDismissed
         props.defaultSuggestions = tostring(getConfiguredSuggestionsPerImage())
         props.maxPhotosPerRun = tostring(getConfiguredMaxPhotosPerRun())
@@ -138,12 +207,14 @@ LrTasks.startAsyncTask(function()
         local actionVerb = nil
         local actionMode = nil
 
+        -- Build platform-specific dialog
         if IS_WINDOWS then
             local paths = getWindowsPaths()
             local hasInstall = pathExists(paths.uninstaller)
             actionVerb = hasInstall and "Run Ollama Uninstaller" or nil
             actionMode = hasInstall and "windows_uninstall" or nil
 
+            -- Windows-specific dialog content
             contents = f:column {
                 bind_to_object = props,
                 spacing = 8,
@@ -176,6 +247,7 @@ LrTasks.startAsyncTask(function()
             actionVerb = "Show macOS Uninstall Steps"
             actionMode = "mac_uninstall_help"
 
+            -- macOS/Linux-specific dialog content
             contents = f:column {
                 bind_to_object = props,
                 spacing = 8,
@@ -207,6 +279,7 @@ LrTasks.startAsyncTask(function()
             }
         end
 
+        -- Display dialog and get user response
         local result = LrDialogs.presentModalDialog {
             title = "Manage Local AI Runtime",
             contents = contents,
@@ -214,24 +287,28 @@ LrTasks.startAsyncTask(function()
             cancelVerb = "Done"
         }
 
+        -- Validate and save suggestions per image
         local suggestions = tonumber(props.defaultSuggestions)
         if not suggestions then
             suggestions = getConfiguredSuggestionsPerImage()
         end
         suggestions = math.max(1, math.min(30, math.floor(suggestions)))
 
+        -- Validate and save max photos per run
         local maxPhotos = tonumber(props.maxPhotosPerRun)
         if not maxPhotos then
             maxPhotos = getConfiguredMaxPhotosPerRun()
         end
         maxPhotos = math.max(1, math.min(200, math.floor(maxPhotos)))
 
+        -- Persist all settings to preferences
         prefs.aiDefaultSuggestionsPerImage = suggestions
         prefs.aiMaxPhotosPerRun = maxPhotos
         prefs.aiLowMemoryMode = props.lowMemoryMode and true or false
         prefs.aiPreferCpu = props.preferCpu and true or false
         prefs.aiBootstrapNoticeDismissed = props.showStartupNotice and true or false
 
+        -- Handle action button click
         if result == "ok" then
             if actionMode == "windows_uninstall" then
                 launchWindowsUninstaller(getWindowsPaths().uninstaller)

@@ -1,3 +1,36 @@
+# ============================================================================
+# OLLAMAKEYWORDBRIDGE.PS1
+# Windows PowerShell Script for Ollama-based Keyword Suggestion
+# ============================================================================
+#
+# PURPOSE:
+# This script is called by the Lightroom plugin to generate keyword suggestions
+# using Ollama's vision models. It handles Ollama installation, model downloads,
+# API communication, and vision analysis of photos.
+#
+# USAGE:
+# OllamaKeywordBridge.ps1 <ImagePath> <HistoryFile> <OutputFile> [<MaxSuggestions>] [<SettingsFile>]
+#
+# PARAMETERS:
+#   ImagePath        - Absolute path to the photo file to analyze
+#   HistoryFile      - Path to file containing previously used keywords (context)
+#   OutputFile       - Path where keyword suggestions should be written
+#   MaxSuggestions   - Maximum number of suggestions to generate (default: 10)
+#   SettingsFile     - Path to settings file with MODEL, CPU_ONLY, etc. (optional)
+#
+# OUTPUT:
+# Writes generated keywords to OutputFile, comma or newline separated
+# Keywords can come from multiple models if the configured one isn't available
+#
+# FEATURES:
+# - Auto-installs Ollama if not found
+# - Auto-pulls vision models if not cached locally
+# - Polls Ollama API until it's ready
+# - Supports model specification via environment or settings file
+# - Handles CPU-only mode for systems without GPU
+# - Includes existing keywords in context for better suggestions
+# ============================================================================
+
 param(
     [string]$ImagePath,
     [string]$HistoryFile,
@@ -7,6 +40,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 function Write-EmptyOutput {
     param([string]$Path)

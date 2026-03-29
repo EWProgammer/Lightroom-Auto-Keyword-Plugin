@@ -1,3 +1,46 @@
+-- ============================================================================
+-- KEYWORDRUNNER.LUA
+-- Main Keyword Generation Engine for Lightroom Photos
+-- ============================================================================
+--
+-- OVERVIEW:
+-- This is the core module that handles all keywording functionality. It
+-- manages the complete workflow from user interaction through keyword
+-- suggestion, filtering, mapping, and final assignment to selected photos.
+--
+-- MAIN FEATURES:
+-- 1. Multi-mode keyword generation:
+--    - Full Keywording: AI + metadata + style mapping + quick tags
+--    - Metadata Only: Extract date, season, camera, lens info
+--    - AI Assist: Use local Ollama vision model for content-based suggestions
+--
+-- 2. Style Preset System:
+--    - Define custom keyword hierarchies (e.g., "Wedding" style)
+--    - Apply styles to automatically add specific keywords
+--
+-- 3. AI Processing:
+--    - Integrates with Ollama running locally
+--    - Auto-installs Ollama and models if needed
+--    - Renders temporary JPEG previews for AI analysis
+--    - Cleans up temp files after processing
+--
+-- 4. Keyword Management:
+--    - Creates/updates Lightroom keyword hierarchies
+--    - Deduplicates keywords intelligently
+--    - Prevents re-adding existing keywords
+--
+-- 5. Progress Tracking:
+--    - Real-time feedback for batch processing
+--    - Handles cancellation gracefully
+--
+-- ARCHITECTURE:
+-- - Keyword caching to minimize Lightroom API calls
+-- - Safe keyword creation with proper parent-child relationships
+-- - Settings file communication with external AI processes
+-- - Temp file cleanup and error handling
+-- ============================================================================
+
+-- Import Lightroom SDK libraries
 local LrApplication = import 'LrApplication'
 local LrTasks = import 'LrTasks'
 local LrProgressScope = import 'LrProgressScope'
@@ -8,11 +51,21 @@ local LrFunctionContext = import 'LrFunctionContext'
 local LrPathUtils = import 'LrPathUtils'
 local LrPrefs = import 'LrPrefs'
 
--- ===== SAFE CACHE =====
+-- ============================================================================
+-- KEYWORD CACHING SYSTEM
+-- Improves performance by reducing Lightroom API calls
+-- ============================================================================
+
+-- Cache for keyword objects by lowercase name
 local keywordCache = {}
+
+-- Cache for full keyword paths to avoid recreation
 local keywordPathCache = {}
+
+-- Wrapper function for safe Lightroom keyword method calls
 local safeKeywordCall
 
+-- Trim helper function
 local function trim(value)
     if value == nil then return nil end
     local s = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
@@ -20,15 +73,29 @@ local function trim(value)
     return s
 end
 
+-- ============================================================================
+-- KEYWORD CREATION AND PATH BUILDING
+-- Safely creates keyword hierarchies in Lightroom
+-- ============================================================================
+
+--- Creates or retrieves a keyword from the catalog
+-- Uses caching to prevent duplicate creation and improve performance
+-- @param catalog The Lightroom catalog
+-- @param name The keyword name to create or retrieve
+-- @param parent The parent keyword object (for hierarchies)
+-- @param key Optional cache key (defaults to name)
+-- @return The keyword object, or nil on failure
 local function getOrCreateKeyword(catalog, name, parent, key)
     name = trim(name)
     if not catalog or not name then return nil end
     key = key or name
 
+    -- Check cache first
     if keywordPathCache[key] then
         return keywordPathCache[key]
     end
 
+    -- Create new keyword in Lightroom
     local kw = catalog:createKeyword(name, {}, false, parent, true)
     if kw then
         keywordPathCache[key] = kw
@@ -37,7 +104,11 @@ local function getOrCreateKeyword(catalog, name, parent, key)
     return kw
 end
 
--- ===== SAFE PATH BUILDER =====
+--- Builds and returns a complete keyword hierarchy path
+-- Splits pipe-separated path and creates nested keywords as needed
+-- @param catalog The Lightroom catalog
+-- @param path Pipe-separated hierarchy path (e.g., "Parent|Child|Grandchild")
+-- @return The deepest keyword object in the hierarchy, or nil on failure
 local function getOrCreatePath(catalog, path)
     path = trim(path)
     if not path then return nil end
@@ -45,11 +116,12 @@ local function getOrCreatePath(catalog, path)
     local parent = nil
     local currentPath = ""
 
+    -- Create each level of the hierarchy
     for part in string.gmatch(path, "[^|]+") do
         part = trim(part)
         if part then
-        currentPath = (currentPath == "" and part) or (currentPath .. "|" .. part)
-        parent = getOrCreateKeyword(catalog, part, parent, currentPath)
+            currentPath = (currentPath == "" and part) or (currentPath .. "|" .. part)
+            parent = getOrCreateKeyword(catalog, part, parent, currentPath)
             if not parent then
                 return nil
             end
@@ -59,11 +131,20 @@ local function getOrCreatePath(catalog, path)
     return parent
 end
 
--- ===== HELPERS =====
+-- ============================================================================
+-- HELPER UTILITIES
+-- Text processing and sanitization functions
+-- ============================================================================
+
+--- Alias for trim function
 local function clean(val)
     return trim(val)
 end
 
+--- Sanitizes a single keyword segment (part of a path)
+-- Removes leading/trailing whitespace and converts pipe chars
+-- @param value The keyword segment
+-- @return Sanitized segment or nil if empty
 local function sanitizeSegment(value)
     local s = clean(value)
     if not s then return nil end
@@ -71,10 +152,15 @@ local function sanitizeSegment(value)
     return clean(s)
 end
 
+--- Normalizes keyword hierarchy paths to standard format
+-- Handles multiple input formats and converts to pipe-separated
+-- @param value The path in any supported format
+-- @return Normalized path using pipe (|) separators, or nil if invalid
 local function sanitizeHierarchyPath(value)
     local s = clean(value)
     if not s then return nil end
 
+    -- Handle Windows-style backslash paths (e.g., from file system navigation)
     if s:find("\\", 1, true) and not s:find("^%a:[/\\]") and not s:find("|", 1, true) and not s:find(">", 1, true) and not s:find("<", 1, true) and not s:find("›", 1, true) then
         local parts = {}
         for part in s:gmatch("[^\\]+") do
@@ -88,6 +174,7 @@ local function sanitizeHierarchyPath(value)
         end
     end
 
+    -- Handle reversed hierarchy format: "child < parent < grandparent"
     -- Lightroom supports hierarchy entry with |, >, and <.
     -- For "dog < animal", reverse into "animal|dog".
     if s:find("<", 1, true) and not s:find("|", 1, true) and not s:find(">", 1, true) and not s:find("›", 1, true) then
@@ -107,6 +194,7 @@ local function sanitizeHierarchyPath(value)
         return table.concat(ordered, "|")
     end
 
+    -- Convert all arrow-style separators to pipe
     s = s:gsub("%s*[>›<]%s*", "|")
     local parts = {}
     for part in s:gmatch("[^|]+") do
@@ -121,20 +209,14 @@ local function sanitizeHierarchyPath(value)
     return table.concat(parts, "|")
 end
 
--- ===== LOCAL AI BRIDGE =====
--- Set to true after configuring LOCAL_AI_COMMAND.
-local LOCAL_AI_ENABLED = true
+-- ============================================================================
+-- LOCAL AI CONFIGURATION & DEFAULTS
+-- Ollama-based vision model integration for keyword suggestion
+-- ============================================================================
 
--- Local-only command template. It must write plain text keywords to %OUTPUT_FILE%.
--- Tokens:
---   %IMAGE_PATH%   absolute path to photo file
---   %HISTORY_FILE% text file containing prior keyword profile
---   %OUTPUT_FILE%  output file your local AI should write (comma/newline separated)
--- Important: Do not wrap placeholders in quotes; quoting is handled internally.
--- Example:
---   /usr/local/bin/keyword-ai --image %IMAGE_PATH% --history %HISTORY_FILE% --out %OUTPUT_FILE%
-local LOCAL_AI_COMMAND = ''
-
+--- Detects if running on Windows OS
+-- Checks environment variables and package configuration
+-- @return Boolean: true if running on Windows, false otherwise
 local function detectWindows()
     local windir = os.getenv and os.getenv("WINDIR")
     if clean(windir) then
@@ -154,15 +236,43 @@ local function detectWindows()
     return package and package.config and package.config:sub(1, 1) == "\\" or false
 end
 
+-- Detect the operating system once at module load time
 local IS_WINDOWS = detectWindows()
+
+-- Time to wait between AI API calls to prevent overload
 local AI_COOLDOWN_SECONDS = 0.2
+
+-- Default maximum AI suggestions per image
 local AI_DEFAULT_MAX_PHOTOS_PER_RUN = 10
 local AI_DEFAULT_SUGGESTIONS_PER_IMAGE = 10
+
+-- More conservative defaults for Mac systems (less RAM, lower performance)
 local AI_MAC_SAFE_MAX_PHOTOS_PER_RUN = 3
 local AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE = 6
+
+-- Access plugin preferences
 local prefs = LrPrefs.prefsForPlugin()
+
+-- Default style presets
 local STYLE_PRESETS_DEFAULT = "Wedding=Event Type|Wedding;Portrait=Event Type|Portrait;Fine Art=Style|Fine Art"
 
+-- ===== LOCAL AI BRIDGE =====
+-- Set to true after configuring LOCAL_AI_COMMAND.
+local LOCAL_AI_ENABLED = true
+
+-- Local-only command template. It must write plain text keywords to %OUTPUT_FILE%.
+-- Tokens:
+--   %IMAGE_PATH%   absolute path to photo file
+--   %HISTORY_FILE% text file containing prior keyword profile
+--   %OUTPUT_FILE%  output file your local AI should write (comma/newline separated)
+-- Important: Do not wrap placeholders in quotes; quoting is handled internally.
+-- Example:
+--   /usr/local/bin/keyword-ai --image %IMAGE_PATH% --history %HISTORY_FILE% --out %OUTPUT_FILE%
+local LOCAL_AI_COMMAND = ''
+
+--- Gets the configured number of AI suggestions per image
+-- Reads from preferences and clamps to valid range (1-30)
+-- @return Number of suggestions configured
 local function getConfiguredSuggestionsPerImage()
     local n = tonumber(prefs.aiDefaultSuggestionsPerImage)
     if not n then
@@ -171,6 +281,9 @@ local function getConfiguredSuggestionsPerImage()
     return math.max(1, math.min(30, math.floor(n)))
 end
 
+--- Gets the configured maximum number of photos per AI run
+-- Reads from preferences and clamps to valid range (1-200)
+-- @return Maximum photos per run
 local function getConfiguredMaxPhotosPerRun()
     local n = tonumber(prefs.aiMaxPhotosPerRun)
     if not n then
@@ -179,17 +292,22 @@ local function getConfiguredMaxPhotosPerRun()
     return math.max(1, math.min(200, math.floor(n)))
 end
 
+--- Initializes platform-specific AI defaults on first run
+-- Sets lower memory settings for Mac systems
+-- Only runs once per plugin instance
 local function seedPlatformAiDefaults()
     if prefs.aiPlatformDefaultsInitialized then
         return
     end
 
     if not IS_WINDOWS then
+        -- Mac-specific safe defaults (lower RAM requirements)
         prefs.aiLowMemoryMode = true
         prefs.aiPreferCpu = true
         prefs.aiDefaultSuggestionsPerImage = AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE
         prefs.aiMaxPhotosPerRun = AI_MAC_SAFE_MAX_PHOTOS_PER_RUN
     else
+        -- Windows defaults (more capable systems)
         prefs.aiDefaultSuggestionsPerImage = AI_DEFAULT_SUGGESTIONS_PER_IMAGE
         prefs.aiMaxPhotosPerRun = AI_DEFAULT_MAX_PHOTOS_PER_RUN
     end
@@ -197,20 +315,37 @@ local function seedPlatformAiDefaults()
     prefs.aiPlatformDefaultsInitialized = true
 end
 
+-- Initialize defaults on module load
 seedPlatformAiDefaults()
 
+-- ============================================================================
+-- SHELL COMMAND & FILE I/O UTILITIES
+-- Handles cross-platform command execution and temporary file management
+-- ============================================================================
+
+--- Escapes a string for POSIX shell execution (macOS/Linux)
+-- Wraps string in single quotes and escapes internal single quotes
+-- @param value String to escape
+-- @return POSIX-safe quoted string
 local function shellQuotePosix(value)
     local s = tostring(value or '')
     s = s:gsub("'", "'\\''")
     return "'" .. s .. "'"
 end
 
+--- Escapes a string for Windows cmd.exe / PowerShell execution
+-- Wraps string in double quotes and escapes internal double quotes
+-- @param value String to escape
+-- @return Windows-safe quoted string
 local function shellQuoteWindows(value)
     local s = tostring(value or '')
     s = s:gsub('"', '""')
     return '"' .. s .. '"'
 end
 
+--- Quotes a string appropriately for the current platform
+-- @param value String to quote
+-- @return Platform-appropriate quoted string
 local function commandQuote(value)
     if IS_WINDOWS then
         return shellQuoteWindows(value)
@@ -218,6 +353,128 @@ local function commandQuote(value)
     return shellQuotePosix(value)
 end
 
+--- Generates a unique temporary file path to avoid collisions
+-- Uses timestamp and random number for uniqueness
+-- @param prefix Name prefix for the temp file
+-- @param ext File extension
+-- @return Unique full path to temporary file
+local function uniqueTempPath(prefix, ext)
+    local tempDir = LrPathUtils.getStandardFilePath('temp') or '/tmp'
+    local stamp = tostring(os.time()) .. '_' .. tostring(math.random(100000, 999999))
+    return LrPathUtils.child(tempDir, prefix .. '_' .. stamp .. ext)
+end
+
+--- Writes text content to a file
+-- @param path File path to write to
+-- @param text Content to write
+-- @return Boolean: true on success, false on failure
+local function writeTextFile(path, text)
+    local f = io.open(path, "w")
+    if not f then return false end
+    f:write(tostring(text or ""))
+    f:close()
+    return true
+end
+
+--- Writes binary data to a file
+-- @param path File path to write to
+-- @param data Binary data to write
+-- @return Boolean: true on success, false on failure
+local function writeBinaryFile(path, data)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(data)
+    f:close()
+    return true
+end
+
+--- Reads entire file content as text
+-- @param path File path to read
+-- @return File content as string, or empty string if file doesn't exist
+local function readTextFile(path)
+    local f = io.open(path, "r")
+    if not f then return "" end
+    local content = f:read("*a") or ""
+    f:close()
+    return content
+end
+
+--- Safely deletes a file, ignoring errors
+-- Uses pcall to prevent errors from propagating
+-- @param path File path to delete
+local function deleteFile(path)
+    pcall(function() os.remove(path) end)
+end
+
+--- Appends text to end of a file
+-- @param path File path to append to
+-- @param text Content to append
+-- @return Boolean: true on success, false on failure
+local function appendTextFile(path, text)
+    local f = io.open(path, "a")
+    if not f then return false end
+    f:write(tostring(text or ""))
+    f:close()
+    return true
+end
+
+--- Writes settings as key=value pairs to a file
+-- Each key-value pair on its own line, sorted alphabetically
+-- @param path File path to write to
+-- @param values Table of key-value pairs
+-- @return Boolean: true on success, false on failure
+local function writeSettingsFile(path, values)
+    local lines = {}
+    for key, value in pairs(values or {}) do
+        local k = clean(key)
+        local v = clean(value)
+        if k and v then
+            lines[#lines + 1] = k .. "=" .. v
+        end
+    end
+    table.sort(lines)
+    return writeTextFile(path, table.concat(lines, "\n"))
+end
+
+--- Parses AI command output into individual keywords
+-- Handles comma, newline, and semicolon delimiters
+-- Automatically deduplicates (case-insensitive)
+-- @param text Raw output from AI command
+-- @return Array of unique keyword strings
+local function parseAiKeywordOutput(text)
+    local words = {}
+    local seen = {}
+    for token in tostring(text or ''):gmatch('[^,\n\r;]+') do
+        local w = clean(token)
+        if w then
+            local key = string.lower(w)
+            if not seen[key] then
+                seen[key] = true
+                words[#words + 1] = w
+            end
+        end
+    end
+    return words
+end
+
+--- Generates helpful error message if AI returns no keywords
+-- Provides platform-specific guidance
+-- @return Error message string
+local function buildLocalAiNoOutputMessage()
+    if IS_WINDOWS then
+        return "Local AI returned no keywords. Verify Ollama is installed, the Ollama app is running, and a vision model is available (for example llava:latest)."
+    end
+    return "Local AI returned no keywords. Verify Ollama is installed, running, and a vision model is available (for example llava:latest)."
+end
+
+-- ============================================================================
+-- LOCAL AI COMMAND RESOLUTION & PHOTO ANALYSIS
+-- ============================================================================
+
+--- Determines which AI command template(s) to use
+-- Returns configured custom command if available, otherwise uses built-in
+-- bridge scripts (OllamaKeywordBridge) for Windows or macOS/Linux
+-- @return Array of command template strings, or nil if no commands available
 local function resolveLocalAiCommands()
     local configured = clean(LOCAL_AI_COMMAND)
     if configured then
@@ -239,89 +496,15 @@ local function resolveLocalAiCommands()
     return nil
 end
 
-local function uniqueTempPath(prefix, ext)
-    local tempDir = LrPathUtils.getStandardFilePath('temp') or '/tmp'
-    local stamp = tostring(os.time()) .. '_' .. tostring(math.random(100000, 999999))
-    return LrPathUtils.child(tempDir, prefix .. '_' .. stamp .. ext)
-end
-
-local function writeTextFile(path, text)
-    local f = io.open(path, "w")
-    if not f then return false end
-    f:write(tostring(text or ""))
-    f:close()
-    return true
-end
-
-local function writeBinaryFile(path, data)
-    local f = io.open(path, "wb")
-    if not f then return false end
-    f:write(data)
-    f:close()
-    return true
-end
-
-local function readTextFile(path)
-    local f = io.open(path, "r")
-    if not f then return "" end
-    local content = f:read("*a") or ""
-    f:close()
-    return content
-end
-
-local function deleteFile(path)
-    pcall(function() os.remove(path) end)
-end
-
-local function appendTextFile(path, text)
-    local f = io.open(path, "a")
-    if not f then return false end
-    f:write(tostring(text or ""))
-    f:close()
-    return true
-end
-
-local function writeSettingsFile(path, values)
-    local lines = {}
-    for key, value in pairs(values or {}) do
-        local k = clean(key)
-        local v = clean(value)
-        if k and v then
-            lines[#lines + 1] = k .. "=" .. v
-        end
-    end
-    table.sort(lines)
-    return writeTextFile(path, table.concat(lines, "\n"))
-end
-
-local function parseAiKeywordOutput(text)
-    local words = {}
-    local seen = {}
-    for token in tostring(text or ''):gmatch('[^,\n\r;]+') do
-        local w = clean(token)
-        if w then
-            local key = string.lower(w)
-            if not seen[key] then
-                seen[key] = true
-                words[#words + 1] = w
-            end
-        end
-    end
-    return words
-end
-
-local function buildLocalAiNoOutputMessage()
-    if IS_WINDOWS then
-        return "Local AI returned no keywords. Verify Ollama is installed, the Ollama app is running, and a vision model is available (for example llava:latest)."
-    end
-    return "Local AI returned no keywords. Verify Ollama is installed, running, and a vision model is available (for example llava:latest)."
-end
-
+--- Extracts and organizes keywords already attached to a photo
+-- Builds lookup maps for quick deduplication checks
+-- @param photo Lightroom photo object
+-- @return State table with paths, leaves, and labels arrays
 local function getPhotoAttachedKeywordState(photo)
     local state = {
-        paths = {},
-        leaves = {},
-        labels = {}
+        paths = {},     -- Full hierarchy paths (lowercase keys)
+        leaves = {},    -- Leaf keyword names (lowercase keys)
+        labels = {}     -- Array of actual keyword names
     }
 
     if not photo then
@@ -333,6 +516,7 @@ local function getPhotoAttachedKeywordState(photo)
         rawKeywords = photo:getRawMetadata("keywords")
     end)
 
+    -- Process existing keywords
     for _, keyword in ipairs(rawKeywords or {}) do
         local name = clean(safeKeywordCall(keyword, "getName"))
         local fullPath = sanitizeHierarchyPath(safeKeywordCall(keyword, "getNameViaHierarchy")) or name
@@ -348,6 +532,7 @@ local function getPhotoAttachedKeywordState(photo)
         end
     end
 
+    -- Fallback to formatted metadata if keyword objects aren't accessible
     if #state.labels == 0 then
         local tagText = clean(photo:getFormattedMetadata("keywordTags"))
         if tagText then
@@ -367,6 +552,11 @@ local function getPhotoAttachedKeywordState(photo)
     return state
 end
 
+--- Checks if a keyword is already attached to a photo
+-- Uses the attached keyword state to avoid duplicate keywords
+-- @param path Keyword hierarchy path to check
+-- @param attachedKeywordState The state table from getPhotoAttachedKeywordState
+-- @return Boolean: true if keyword already exists on photo
 local function isKeywordAlreadyAttached(path, attachedKeywordState)
     if not attachedKeywordState or not path then
         return false
@@ -377,10 +567,12 @@ local function isKeywordAlreadyAttached(path, attachedKeywordState)
         return false
     end
 
+    -- Check full path match
     if attachedKeywordState.paths[string.lower(normalized)] then
         return true
     end
 
+    -- Check leaf keyword match
     local leaf = normalized:match("([^|]+)$")
     if leaf and attachedKeywordState.leaves[string.lower(leaf)] then
         return true
@@ -389,17 +581,25 @@ local function isKeywordAlreadyAttached(path, attachedKeywordState)
     return false
 end
 
+--- Builds runtime settings for AI processing
+-- Encodes preferences like model choice, CPU preference, and existing keywords
+-- @param aiSettings Table with lowMemoryMode and preferCpu flags
+-- @param attachedKeywordState State of keywords already on the photo
+-- @return Table of settings to write to settings file
 local function buildAiRuntimeSettings(aiSettings, attachedKeywordState)
     local values = {}
 
+    -- Use smaller model in low memory mode
     if aiSettings and aiSettings.lowMemoryMode then
         values.MODEL = "gemma3:4b"
     end
 
+    -- Force CPU execution instead of GPU if preferred
     if aiSettings and aiSettings.preferCpu then
         values.CPU_ONLY = "true"
     end
 
+    -- Pass existing keywords to AI for context (limit to 40 for performance)
     if attachedKeywordState and attachedKeywordState.labels and #attachedKeywordState.labels > 0 then
         local labels = {}
         for i = 1, math.min(#attachedKeywordState.labels, 40) do
@@ -411,6 +611,11 @@ local function buildAiRuntimeSettings(aiSettings, attachedKeywordState)
     return values
 end
 
+--- Renders a Lightroom photo thumbnail as JPEG for AI analysis
+-- Lightroom creates temporary JPEG previews on demand
+-- This waits for completion with timeout protection
+-- @param photo Lightroom photo object
+-- @return Path to temp JPEG file, or nil with error message on failure
 local function renderAiThumbnail(photo)
     if not photo then
         return nil, "Missing photo"
@@ -421,12 +626,14 @@ local function renderAiThumbnail(photo)
     local thumbError = nil
     local completed = false
 
+    -- Request JPEG thumbnail from Lightroom (1024x1024 max)
     request = photo:requestJpegThumbnail(1024, 1024, function(data, err)
         jpegData = data
         thumbError = err
         completed = true
     end)
 
+    -- Wait for completion (up to 20 seconds = 400 * 0.05)
     local attempts = 0
     while not completed and attempts < 400 do
         LrTasks.sleep(0.05)
@@ -443,6 +650,7 @@ local function renderAiThumbnail(photo)
         return nil, thumbError or "Failed to render Lightroom preview"
     end
 
+    -- Write JPEG to temp file
     local thumbnailPath = uniqueTempPath('lrkw_ai_thumb', '.jpg')
     if not writeBinaryFile(thumbnailPath, jpegData) then
         return nil, "Failed to create temp JPEG preview for AI"
