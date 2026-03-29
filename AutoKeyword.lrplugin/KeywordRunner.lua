@@ -618,6 +618,9 @@ local function buildAiRuntimeSettings(aiSettings, attachedKeywordState)
     -- Use smaller model in low memory mode
     if aiSettings and aiSettings.lowMemoryMode then
         values.MODEL = "gemma3:4b"
+        values.NUM_CTX = "1024"
+    else
+        values.NUM_CTX = "2048"
     end
 
     -- Force CPU execution instead of GPU if preferred

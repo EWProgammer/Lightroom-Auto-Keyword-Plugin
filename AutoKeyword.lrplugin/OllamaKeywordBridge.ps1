@@ -292,6 +292,9 @@ try {
         stream     = $false
         keep_alive = '10m'
         images     = @($imageBase64)
+        options    = @{
+            num_ctx = if ([string]::IsNullOrWhiteSpace($bridgeSettings['NUM_CTX'])) { 2048 } else { [int]$bridgeSettings['NUM_CTX'] }
+        }
     } | ConvertTo-Json -Depth 5 -Compress
 
     $response = Invoke-RestMethod -Uri ($ollamaHost + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300
