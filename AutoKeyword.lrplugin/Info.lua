@@ -7,6 +7,33 @@
 -- file, and all menu items available to users.
 -- ============================================================================
 
+local menuItems = {
+    -- Primary menu item: Generates AI keywords for selected photos
+    {
+        title = "Generate Keywords...",
+        file = "KeywordRunner.lua",
+        enabledWhen = "photosSelected",  -- Only enabled when at least one photo is selected
+    },
+    
+    -- Settings menu item: Create and edit keyword style presets
+    {
+        title = "Style Presets...",
+        file = "MenuEntry.lua",
+    },
+    
+    -- Settings menu item: Configure Ollama AI runtime and model settings
+    {
+        title = "Local AI Settings...",
+        file = "LocalAiRuntimeManager.lua",
+    },
+    
+    -- Utility menu item: Check GitHub for plugin updates
+    {
+        title = "Check for Updates...",
+        file = "PluginUpdater.lua",
+    },
+}
+
 return {
     -- SDK version required for Lightroom compatibility
     LrSdkVersion = 6.0,
@@ -24,30 +51,5 @@ return {
     VERSION = { major=1, minor=4, revision=2, build=0 },
 
     -- Menu items added to Lightroom's Library module
-    LrLibraryMenuItems = {
-        -- Primary menu item: Generates AI keywords for selected photos
-        {
-            title = "Generate Keywords...",
-            file = "KeywordRunner.lua",
-            enabledWhen = "photosSelected",  -- Only enabled when at least one photo is selected
-        },
-        
-        -- Settings menu item: Create and edit keyword style presets
-        {
-            title = "Style Presets...",
-            file = "MenuEntry.lua",
-        },
-        
-        -- Settings menu item: Configure Ollama AI runtime and model settings
-        {
-            title = "Local AI Settings...",
-            file = "LocalAiRuntimeManager.lua",
-        },
-        
-        -- Utility menu item: Check GitHub for plugin updates
-        {
-            title = "Check for Updates...",
-            file = "PluginUpdater.lua",
-        },
-    },
+    LrLibraryMenuItems = menuItems,
 }

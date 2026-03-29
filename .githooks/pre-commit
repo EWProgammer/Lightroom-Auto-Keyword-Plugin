@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+info_file="AutoKeyword.lrplugin/Info.lua"
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if ! printf '%s\n' "$staged_files" | grep -q '^AutoKeyword\.lrplugin/'; then
+  exit 0
+fi
+
+if printf '%s\n' "$staged_files" | grep -q '^AutoKeyword\.lrplugin/Info\.lua$'; then
+  exit 0
+fi
+
+tmp_file="$(mktemp)"
+
+awk '
+  match($0, /VERSION = \{ major=([0-9]+), minor=([0-9]+), revision=([0-9]+), build=([0-9]+) \}/, m) {
+    build = m[4] + 1
+    printf("    VERSION = { major=%d, minor=%d, revision=%d, build=%d }\n", m[1], m[2], m[3], build)
+    next
+  }
+  { print }
+' "$info_file" > "$tmp_file"
+
+if cmp -s "$info_file" "$tmp_file"; then
+  rm -f "$tmp_file"
+  echo "[creator hook] VERSION line not changed. Commiting without auto-bump." >&2
+  exit 0
+fi
+
+mv "$tmp_file" "$info_file"
+git add "$info_file"
+
+new_version="$(grep 'VERSION = {' "$info_file" | sed -E 's/.*major=([0-9]+), minor=([0-9]+), revision=([0-9]+), build=([0-9]+).*/\1.\2.\3.\4/')"
+echo "[creator hook] Auto-bumped plugin version to $new_version" >&2
