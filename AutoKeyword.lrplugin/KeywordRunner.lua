@@ -239,8 +239,12 @@ end
 -- Detect the operating system once at module load time
 local IS_WINDOWS = detectWindows()
 
--- Time to wait between AI API calls to prevent overload
-local AI_COOLDOWN_SECONDS = 0.2
+-- Time to wait between AI API calls. Keep this at zero for faster batch runs.
+local AI_COOLDOWN_SECONDS = 0
+
+-- Preview sizes for Local AI thumbnail rendering
+local AI_DEFAULT_THUMBNAIL_SIZE = 1024
+local AI_LOW_MEMORY_THUMBNAIL_SIZE = 768
 
 -- Default maximum AI suggestions per image
 local AI_DEFAULT_MAX_PHOTOS_PER_RUN = 10
@@ -249,6 +253,9 @@ local AI_DEFAULT_SUGGESTIONS_PER_IMAGE = 10
 -- More conservative defaults for Mac systems (less RAM, lower performance)
 local AI_MAC_SAFE_MAX_PHOTOS_PER_RUN = 3
 local AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE = 6
+local AI_PROFILE_FASTEST = "fastest"
+local AI_PROFILE_BALANCED = "balanced"
+local AI_PROFILE_LOW_MEMORY = "low_memory"
 
 -- Access plugin preferences
 local prefs = LrPrefs.prefsForPlugin()
@@ -292,6 +299,23 @@ local function getConfiguredMaxPhotosPerRun()
     return math.max(1, math.min(200, math.floor(n)))
 end
 
+local function getConfiguredPerformanceProfile()
+    local profile = clean(prefs.aiPerformanceProfile)
+    if profile == AI_PROFILE_FASTEST or profile == AI_PROFILE_BALANCED or profile == AI_PROFILE_LOW_MEMORY then
+        return profile
+    end
+
+    if prefs.aiLowMemoryMode and prefs.aiPreferCpu then
+        return AI_PROFILE_LOW_MEMORY
+    end
+
+    if prefs.aiLowMemoryMode or prefs.aiPreferCpu then
+        return AI_PROFILE_BALANCED
+    end
+
+    return AI_PROFILE_FASTEST
+end
+
 --- Initializes platform-specific AI defaults on first run
 -- Sets lower memory settings for Mac systems
 -- Only runs once per plugin instance
@@ -302,12 +326,14 @@ local function seedPlatformAiDefaults()
 
     if not IS_WINDOWS then
         -- Mac-specific safe defaults (lower RAM requirements)
+        prefs.aiPerformanceProfile = AI_PROFILE_LOW_MEMORY
         prefs.aiLowMemoryMode = true
         prefs.aiPreferCpu = true
         prefs.aiDefaultSuggestionsPerImage = AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE
         prefs.aiMaxPhotosPerRun = AI_MAC_SAFE_MAX_PHOTOS_PER_RUN
     else
         -- Windows defaults (more capable systems)
+        prefs.aiPerformanceProfile = AI_PROFILE_BALANCED
         prefs.aiDefaultSuggestionsPerImage = AI_DEFAULT_SUGGESTIONS_PER_IMAGE
         prefs.aiMaxPhotosPerRun = AI_DEFAULT_MAX_PHOTOS_PER_RUN
     end
@@ -616,7 +642,7 @@ end
 -- This waits for completion with timeout protection
 -- @param photo Lightroom photo object
 -- @return Path to temp JPEG file, or nil with error message on failure
-local function renderAiThumbnail(photo)
+local function renderAiThumbnail(photo, aiSettings)
     if not photo then
         return nil, "Missing photo"
     end
@@ -626,8 +652,12 @@ local function renderAiThumbnail(photo)
     local thumbError = nil
     local completed = false
 
-    -- Request JPEG thumbnail from Lightroom (1024x1024 max)
-    request = photo:requestJpegThumbnail(1024, 1024, function(data, err)
+    local thumbnailSize = AI_DEFAULT_THUMBNAIL_SIZE
+    if aiSettings and aiSettings.lowMemoryMode then
+        thumbnailSize = AI_LOW_MEMORY_THUMBNAIL_SIZE
+    end
+
+    request = photo:requestJpegThumbnail(thumbnailSize, thumbnailSize, function(data, err)
         jpegData = data
         thumbError = err
         completed = true
@@ -679,7 +709,7 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, aiSettings)
         imagePath = clean(photoOrPath)
     else
         attachedKeywordState = getPhotoAttachedKeywordState(photoOrPath)
-        imagePath, imageError = renderAiThumbnail(photoOrPath)
+        imagePath, imageError = renderAiThumbnail(photoOrPath, aiSettings)
         imageCleanupPath = imagePath
     end
 
@@ -1003,6 +1033,148 @@ local function parseStylePresetText(presetText)
     return styles, styleOrder, text
 end
 
+local function promptKeywordRunSetup()
+    local config = nil
+
+    LrFunctionContext.callWithContext("keywordRunSetupDialog", function(context)
+        local f = LrView.osFactory()
+        local props = LrBinding.makePropertyTable(context)
+
+        local parsedStyles, styleOrder = parseStylePresetText(prefs.stylePresetText)
+        local styleItems = {
+            { title = "No Style", value = "No Style" }
+        }
+
+        table.sort(styleOrder)
+        for _, styleName in ipairs(styleOrder) do
+            styleItems[#styleItems + 1] = { title = styleName, value = styleName }
+        end
+
+        props.mode = "full"
+        props.selectedStyle = "No Style"
+        props.quickTags = ""
+        props.suggestionsPerImage = tostring(getConfiguredSuggestionsPerImage())
+        props.hideAiSetupTips = prefs.aiBootstrapNoticeDismissed and true or false
+
+        local contents = f:column {
+            bind_to_object = props,
+            spacing = 12,
+
+            f:static_text {
+                title = "Choose how you want to keyword the selected photos. Settings below only affect this run unless noted otherwise.",
+                width_in_chars = 92
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:column {
+                spacing = 8,
+                f:static_text { title = "Keywording Mode" },
+                f:popup_menu {
+                    value = LrView.bind("mode"),
+                    width_in_chars = 42,
+                    items = {
+                        { title = "Full Keywording: metadata, style, quick tags, and Local AI", value = "ai_local" },
+                        { title = "Standard Keywording: metadata, style, and quick tags", value = "full" },
+                        { title = "Metadata Only: date, season, camera, and lens", value = "camera_only" },
+                    }
+                },
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:column {
+                spacing = 8,
+                f:static_text { title = "Optional Style and Quick Tags" },
+                f:row {
+                    spacing = 10,
+                    f:static_text { title = "Style preset", width_in_chars = 18 },
+                    f:popup_menu {
+                        value = LrView.bind("selectedStyle"),
+                        items = styleItems,
+                        width_in_chars = 28
+                    }
+                },
+                f:static_text {
+                    title = "Quick tags are optional keywords you want applied to every selected photo in this run.",
+                    width_in_chars = 92
+                },
+                f:edit_field {
+                    value = LrView.bind("quickTags"),
+                    width_in_chars = 70
+                },
+                f:static_text {
+                    title = "Manage style presets separately from Library > Plug-in Extras > Manage Style Presets.",
+                    width_in_chars = 92
+                },
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:column {
+                spacing = 8,
+                f:static_text { title = "Local AI Options" },
+                f:row {
+                    spacing = 10,
+                    f:static_text { title = "Suggestions per image", width_in_chars = 18 },
+                    f:edit_field {
+                        value = LrView.bind("suggestionsPerImage"),
+                        width_in_chars = 8
+                    },
+                    f:static_text { title = "Range: 1 to 30", width_in_chars = 18 },
+                },
+                f:static_text {
+                    title = "Low memory mode, CPU preference, and max selected photos are managed in Manage Local AI Runtime.",
+                    width_in_chars = 92
+                },
+                f:static_text {
+                    title = "If Ollama is missing, the plugin can install it automatically and download a vision model the first time you use Local AI.",
+                    width_in_chars = 92
+                },
+                f:checkbox {
+                    title = "Hide Local AI setup tips in the future",
+                    value = LrView.bind("hideAiSetupTips")
+                }
+            },
+        }
+
+        local result = LrDialogs.presentModalDialog {
+            title = "Start Keywording",
+            contents = contents,
+            actionVerb = "Continue",
+            cancelVerb = "Cancel"
+        }
+
+        if result ~= "ok" then
+            return
+        end
+
+        local selectedMode = props.mode or "full"
+        local suggestions = tonumber(props.suggestionsPerImage)
+        if not suggestions then
+            suggestions = getConfiguredSuggestionsPerImage()
+        end
+        suggestions = math.max(1, math.min(30, math.floor(suggestions)))
+        prefs.aiDefaultSuggestionsPerImage = suggestions
+        prefs.aiBootstrapNoticeDismissed = props.hideAiSetupTips and true or false
+
+        local selectedStyleName = clean(props.selectedStyle) or "No Style"
+        config = {
+            mode = selectedMode,
+            styleName = selectedStyleName,
+            stylePaths = parsedStyles[selectedStyleName] or {},
+            quickTags = clean(props.quickTags),
+            aiSettings = {
+                suggestionsPerImage = suggestions,
+                lowMemoryMode = prefs.aiLowMemoryMode and true or false,
+                preferCpu = prefs.aiPreferCpu and true or false
+            }
+        }
+    end)
+
+    return config
+end
+
 local function promptStyleSelection()
     local selectedPaths = {}
     local selectedStyleName = "No Style"
@@ -1165,11 +1337,11 @@ local function promptUnknownKeywordCategories(unknownWords)
         local contents = f:column {
             bind_to_object = props,
             spacing = 8,
-            f:static_text { title = "New AI keywords need a category." },
-            f:static_text { title = "Set category path for each keyword (supports |, >, < hierarchy)." },
+            f:static_text { title = "Review where new AI keywords should be filed in your Lightroom keyword hierarchy." },
+            f:static_text { title = "Use a path such as Nature|Trees or Events|Ceremony. Supported separators: |, >, <, and \\.", width_in_chars = 84 },
             f:row {
                 spacing = 8,
-                f:static_text { title = "Default Category", width_in_chars = 35 },
+                f:static_text { title = "Default category", width_in_chars = 35 },
                 f:edit_field {
                     value = LrView.bind("defaultCategory"),
                     width_in_chars = 28
@@ -1185,9 +1357,9 @@ local function promptUnknownKeywordCategories(unknownWords)
         }
 
         local result = LrDialogs.presentModalDialog {
-            title = "Assign Categories for New AI Keywords",
+            title = "Review New AI Categories",
             contents = contents,
-            actionVerb = "Use Categories",
+            actionVerb = "Continue",
             cancelVerb = "Cancel"
         }
 
@@ -1238,7 +1410,7 @@ local function collectKeywordLearningProfile(photos)
     end)
 
     local top = {}
-    for i = 1, math.min(#ordered, 80) do
+    for i = 1, math.min(#ordered, 40) do
         top[#top + 1] = ordered[i].label
     end
 
@@ -1381,8 +1553,8 @@ local function promptKeywordPreview(uniquePaths)
         local contents = f:column {
             bind_to_object = props,
             spacing = 8,
-            f:static_text { title = "Approve or deny keywords before applying:" },
-            f:static_text { title = "Uncheck a keyword to deny it.", width_in_chars = 60 },
+            f:static_text { title = "Review the keyword plan before anything is written to Lightroom." },
+            f:static_text { title = "Uncheck any keyword you do not want applied to the selected photos.", width_in_chars = 72 },
             f:scrolled_view {
                 width = 620,
                 height = 340,
@@ -1393,7 +1565,7 @@ local function promptKeywordPreview(uniquePaths)
         }
 
         local result = LrDialogs.presentModalDialog {
-            title = "Keyword Preview",
+            title = "Review Keywords",
             contents = contents,
             actionVerb = "Apply Approved Keywords",
             cancelVerb = "Cancel"
@@ -1415,38 +1587,16 @@ end
 -- ===== MAIN =====
 LrTasks.startAsyncTask(function()
 
-    local mode = chooseMode()
-    if not mode then
+    local runConfig = promptKeywordRunSetup()
+    if not runConfig then
         LrDialogs.message("Keywording canceled")
         return
     end
-
-    local aiSettings = nil
-    if mode == "ai_local" then
-        if not promptAiBootstrapNotice() then
-            LrDialogs.message("Keywording canceled")
-            return
-        end
-        aiSettings = promptAiSettings()
-        if not aiSettings then
-            LrDialogs.message("Keywording canceled")
-            return
-        end
-    end
-
-    local selectedStylePaths = {}
-    local selectedStyleName = "No Style"
-    local quickTags = nil
-    if mode == "full" or mode == "ai_local" then
-        local stylePaths, styleName = promptStyleSelection()
-        if stylePaths == nil and styleName == nil then
-            LrDialogs.message("Keywording canceled")
-            return
-        end
-        selectedStylePaths = stylePaths or {}
-        selectedStyleName = styleName or "No Style"
-        quickTags = promptQuickTags()
-    end
+    local mode = runConfig.mode
+    local aiSettings = mode == "ai_local" and runConfig.aiSettings or nil
+    local selectedStylePaths = (mode == "full" or mode == "ai_local") and (runConfig.stylePaths or {}) or {}
+    local selectedStyleName = (mode == "full" or mode == "ai_local") and (runConfig.styleName or "No Style") or "No Style"
+    local quickTags = (mode == "full" or mode == "ai_local") and runConfig.quickTags or nil
 
     local catalog = LrApplication.activeCatalog()
     local photos = catalog:getTargetPhotos()

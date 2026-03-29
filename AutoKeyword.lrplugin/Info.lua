@@ -27,26 +27,26 @@ return {
     LrLibraryMenuItems = {
         -- Primary menu item: Generates AI keywords for selected photos
         {
-            title = "AI Generate Keywords",
+            title = "Generate Keywords...",
             file = "KeywordRunner.lua",
             enabledWhen = "photosSelected",  -- Only enabled when at least one photo is selected
         },
         
         -- Settings menu item: Create and edit keyword style presets
         {
-            title = "Manage Style Presets",
+            title = "Style Presets...",
             file = "MenuEntry.lua",
         },
         
         -- Settings menu item: Configure Ollama AI runtime and model settings
         {
-            title = "Manage Local AI Runtime",
+            title = "Local AI Settings...",
             file = "LocalAiRuntimeManager.lua",
         },
         
         -- Utility menu item: Check GitHub for plugin updates
         {
-            title = "Check for Plugin Updates",
+            title = "Check for Updates...",
             file = "PluginUpdater.lua",
         },
     },

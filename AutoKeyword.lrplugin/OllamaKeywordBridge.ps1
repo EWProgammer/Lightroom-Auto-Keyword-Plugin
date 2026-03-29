@@ -287,10 +287,11 @@ try {
     $imageBytes = [System.IO.File]::ReadAllBytes($ImagePath)
     $imageBase64 = [Convert]::ToBase64String($imageBytes)
     $body = @{
-        model  = $model
-        prompt = $prompt
-        stream = $false
-        images = @($imageBase64)
+        model      = $model
+        prompt     = $prompt
+        stream     = $false
+        keep_alive = '10m'
+        images     = @($imageBase64)
     } | ConvertTo-Json -Depth 5 -Compress
 
     $response = Invoke-RestMethod -Uri ($ollamaHost + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300

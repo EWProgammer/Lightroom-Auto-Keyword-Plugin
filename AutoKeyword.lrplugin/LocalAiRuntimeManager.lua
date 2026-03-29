@@ -81,6 +81,9 @@ local DEFAULT_MAX_PHOTOS = 10
 -- Conservative defaults for Mac systems (lower RAM)
 local MAC_SAFE_SUGGESTIONS = 6
 local MAC_SAFE_MAX_PHOTOS = 3
+local PROFILE_FASTEST = "fastest"
+local PROFILE_BALANCED = "balanced"
+local PROFILE_LOW_MEMORY = "low_memory"
 
 --- Gets configured suggestions per image from preferences
 -- @return Number clamped to range 1-30
@@ -100,6 +103,23 @@ local function getConfiguredMaxPhotosPerRun()
         n = DEFAULT_MAX_PHOTOS
     end
     return math.max(1, math.min(200, math.floor(n)))
+end
+
+local function getConfiguredPerformanceProfile()
+    local profile = trim(prefs.aiPerformanceProfile)
+    if profile == PROFILE_FASTEST or profile == PROFILE_BALANCED or profile == PROFILE_LOW_MEMORY then
+        return profile
+    end
+
+    if prefs.aiLowMemoryMode and prefs.aiPreferCpu then
+        return PROFILE_LOW_MEMORY
+    end
+
+    if prefs.aiLowMemoryMode or prefs.aiPreferCpu then
+        return PROFILE_BALANCED
+    end
+
+    return PROFILE_FASTEST
 end
 
 -- ============================================================================
@@ -186,135 +206,228 @@ end
 -- MAIN DIALOG UI
 -- ============================================================================
 
--- Start async task to avoid blocking Lightroom
+local function applyStandardDefaults(props)
+    props.performanceProfile = PROFILE_BALANCED
+    props.defaultSuggestions = tostring(DEFAULT_SUGGESTIONS)
+    props.maxPhotosPerRun = tostring(DEFAULT_MAX_PHOTOS)
+end
+
+local function applyMacSafeDefaults(props)
+    props.performanceProfile = PROFILE_LOW_MEMORY
+    props.defaultSuggestions = tostring(MAC_SAFE_SUGGESTIONS)
+    props.maxPhotosPerRun = tostring(MAC_SAFE_MAX_PHOTOS)
+end
+
+local function getProfileSettings(profile)
+    if profile == PROFILE_LOW_MEMORY then
+        return true, true, "Lowest memory usage. Best for older or RAM-constrained Macs, but usually the slowest."
+    end
+
+    if profile == PROFILE_BALANCED then
+        return true, false, "A middle ground. Uses a smaller model without forcing CPU-only execution."
+    end
+
+    return false, false, "Best speed. Uses the larger model and allows hardware acceleration when available."
+end
+
+local function getProfileTitle(profile)
+    if profile == PROFILE_LOW_MEMORY then
+        return "Low Memory"
+    end
+    if profile == PROFILE_BALANCED then
+        return "Balanced"
+    end
+    return "Fastest"
+end
+
+local function clampWholeNumber(value, fallback, minValue, maxValue)
+    local n = tonumber(value)
+    if not n then
+        n = fallback
+    end
+    return math.max(minValue, math.min(maxValue, math.floor(n)))
+end
+
+local function saveRuntimeSettings(props)
+    local suggestions = clampWholeNumber(props.defaultSuggestions, getConfiguredSuggestionsPerImage(), 1, 30)
+    local maxPhotos = clampWholeNumber(props.maxPhotosPerRun, getConfiguredMaxPhotosPerRun(), 1, 200)
+    local profile = trim(props.performanceProfile) or PROFILE_BALANCED
+    local lowMemoryMode, preferCpu = getProfileSettings(profile)
+
+    prefs.aiDefaultSuggestionsPerImage = suggestions
+    prefs.aiMaxPhotosPerRun = maxPhotos
+    prefs.aiPerformanceProfile = profile
+    prefs.aiLowMemoryMode = lowMemoryMode and true or false
+    prefs.aiPreferCpu = preferCpu and true or false
+    prefs.aiBootstrapNoticeDismissed = props.hideStartupNotice and true or false
+
+    return suggestions, maxPhotos, profile
+end
+
 LrTasks.startAsyncTask(function()
-    -- Create dialog context
     LrFunctionContext.callWithContext("localAiRuntimeManagerDialog", function(context)
-        -- UI factory for creating controls
         local f = LrView.osFactory()
-        
-        -- Property table for two-way data binding
         local props = LrBinding.makePropertyTable(context)
-        
-        -- Initialize properties from preferences
-        props.showStartupNotice = not not prefs.aiBootstrapNoticeDismissed
+
+        props.hideStartupNotice = prefs.aiBootstrapNoticeDismissed and true or false
         props.defaultSuggestions = tostring(getConfiguredSuggestionsPerImage())
         props.maxPhotosPerRun = tostring(getConfiguredMaxPhotosPerRun())
-        props.lowMemoryMode = prefs.aiLowMemoryMode and true or false
-        props.preferCpu = prefs.aiPreferCpu and true or false
+        props.performanceProfile = getConfiguredPerformanceProfile()
 
-        local contents = nil
-        local actionVerb = nil
-        local actionMode = nil
+        local installSummary = nil
+        local uninstallButtonTitle = nil
+        local uninstallAction = nil
 
-        -- Build platform-specific dialog
         if IS_WINDOWS then
             local paths = getWindowsPaths()
-            local hasInstall = pathExists(paths.uninstaller)
-            actionVerb = hasInstall and "Run Ollama Uninstaller" or nil
-            actionMode = hasInstall and "windows_uninstall" or nil
-
-            -- Windows-specific dialog content
-            contents = f:column {
-                bind_to_object = props,
-                spacing = 8,
-                f:static_text { title = "Local AI Runtime Details", width_in_chars = 90 },
-                f:static_text { title = "This plugin can automatically install Ollama and download a vision model on the first AI run if Ollama is missing.", width_in_chars = 90 },
-                f:static_text { title = "The first AI run may take several minutes and multiple gigabytes of downloads.", width_in_chars = 90 },
+            installSummary = f:column {
+                spacing = 4,
                 f:static_text { title = "Ollama install location: " .. tostring(paths.installDir or "Unknown"), width_in_chars = 90 },
-                f:static_text { title = "Ollama model storage: " .. tostring(paths.modelsDir or "Unknown"), width_in_chars = 90 },
-                f:static_text { title = "Temporary Lightroom JPEG previews are written to your temp folder only for the duration of an AI run and then deleted.", width_in_chars = 90 },
-                f:static_text { title = "Default suggestions per image:", width_in_chars = 35 },
-                f:edit_field { value = LrView.bind("defaultSuggestions"), width_in_chars = 6 },
-                f:static_text { title = "Max selected photos allowed per AI run:", width_in_chars = 35 },
-                f:edit_field { value = LrView.bind("maxPhotosPerRun"), width_in_chars = 6 },
-                f:checkbox {
-                    title = "Low memory mode: prefer a smaller vision model",
-                    value = LrView.bind("lowMemoryMode")
-                },
-                f:checkbox {
-                    title = "Prefer CPU when the plugin starts Ollama",
-                    value = LrView.bind("preferCpu")
-                },
-                f:static_text { title = "To fully remove Ollama, use the uninstaller below. Some downloaded models may remain in ~/.ollama unless removed separately.", width_in_chars = 90 },
-                f:checkbox {
-                    title = "Hide the detailed Local AI setup notice before future AI runs",
-                    value = LrView.bind("showStartupNotice")
-                }
+                f:static_text { title = "Model storage: " .. tostring(paths.modelsDir or "Unknown"), width_in_chars = 90 },
             }
+
+            if pathExists(paths.uninstaller) then
+                uninstallButtonTitle = "Run Ollama Uninstaller"
+                uninstallAction = function()
+                    launchWindowsUninstaller(paths.uninstaller)
+                end
+            end
         else
             local paths = getMacPaths()
-            actionVerb = "Show macOS Uninstall Steps"
-            actionMode = "mac_uninstall_help"
-
-            -- macOS/Linux-specific dialog content
-            contents = f:column {
-                bind_to_object = props,
-                spacing = 8,
-                f:static_text { title = "Local AI Runtime Details", width_in_chars = 90 },
-                f:static_text { title = "This plugin can automatically install Ollama and download a vision model on the first AI run if Ollama is missing.", width_in_chars = 90 },
-                f:static_text { title = "The first AI run may take several minutes and multiple gigabytes of downloads.", width_in_chars = 90 },
+            installSummary = f:column {
+                spacing = 4,
                 f:static_text { title = "Ollama app location: " .. tostring(paths.appPath), width_in_chars = 90 },
                 f:static_text { title = "Ollama CLI locations: " .. tostring(paths.cliPath) .. " or " .. tostring(paths.altCliPath), width_in_chars = 90 },
-                f:static_text { title = "Ollama model storage: " .. tostring(paths.modelsDir or "Unknown"), width_in_chars = 90 },
-                f:static_text { title = "Temporary Lightroom JPEG previews are written to your temp folder only for the duration of an AI run and then deleted.", width_in_chars = 90 },
-                f:static_text { title = "Default suggestions per image:", width_in_chars = 35 },
-                f:edit_field { value = LrView.bind("defaultSuggestions"), width_in_chars = 6 },
-                f:static_text { title = "Max selected photos allowed per AI run:", width_in_chars = 35 },
-                f:edit_field { value = LrView.bind("maxPhotosPerRun"), width_in_chars = 6 },
-                f:checkbox {
-                    title = "Low memory mode: prefer a smaller vision model",
-                    value = LrView.bind("lowMemoryMode")
-                },
-                f:checkbox {
-                    title = "Prefer CPU when the plugin starts Ollama",
-                    value = LrView.bind("preferCpu")
-                },
-                f:static_text { title = "Recommended low-end Mac defaults: 6 suggestions, max 3 photos, low memory mode on, prefer CPU on.", width_in_chars = 90 },
-                f:static_text { title = "Use the button below to review the official macOS uninstall paths.", width_in_chars = 90 },
-                f:checkbox {
-                    title = "Hide the detailed Local AI setup notice before future AI runs",
-                    value = LrView.bind("showStartupNotice")
-                }
+                f:static_text { title = "Model storage: " .. tostring(paths.modelsDir or "Unknown"), width_in_chars = 90 },
             }
+
+            uninstallButtonTitle = "Show Uninstall Steps"
+            uninstallAction = function()
+                showMacUninstallInstructions(paths)
+            end
         end
 
-        -- Display dialog and get user response
+        local contents = f:column {
+            bind_to_object = props,
+            spacing = 12,
+
+            f:static_text {
+                title = "Configure how Local AI behaves on this machine. These settings control the default suggestion count, how many photos can be processed in one run, and whether the plugin should prefer lighter Ollama settings.",
+                width_in_chars = 95
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:column {
+                spacing = 8,
+                f:static_text { title = "Performance Defaults", width_in_chars = 40 },
+                f:row {
+                    spacing = 10,
+                    f:static_text { title = "Performance profile", width_in_chars = 28 },
+                    f:popup_menu {
+                        value = LrView.bind("performanceProfile"),
+                        width_in_chars = 20,
+                        items = {
+                            { title = "Fastest", value = PROFILE_FASTEST },
+                            { title = "Balanced", value = PROFILE_BALANCED },
+                            { title = "Low Memory", value = PROFILE_LOW_MEMORY },
+                        }
+                    },
+                },
+                f:static_text {
+                    title = "Fastest uses more resources, Balanced uses a smaller model, and Low Memory also prefers CPU for maximum stability.",
+                    width_in_chars = 95
+                },
+                f:row {
+                    spacing = 10,
+                    f:static_text { title = "Suggestions per image", width_in_chars = 28 },
+                    f:edit_field { value = LrView.bind("defaultSuggestions"), width_in_chars = 8 },
+                    f:static_text { title = "Allowed range: 1 to 30", width_in_chars = 24 },
+                },
+                f:row {
+                    spacing = 10,
+                    f:static_text { title = "Max selected photos per AI run", width_in_chars = 28 },
+                    f:edit_field { value = LrView.bind("maxPhotosPerRun"), width_in_chars = 8 },
+                    f:static_text { title = "Allowed range: 1 to 200", width_in_chars = 24 },
+                },
+                f:checkbox {
+                    title = "Hide the detailed Local AI setup notice before future AI runs",
+                    value = LrView.bind("hideStartupNotice")
+                },
+            },
+
+            f:row {
+                spacing = 10,
+                f:push_button {
+                    title = "Use Standard Defaults",
+                    action = function()
+                        applyStandardDefaults(props)
+                    end
+                },
+                f:push_button {
+                    title = "Use Low-End Mac Defaults",
+                    action = function()
+                        applyMacSafeDefaults(props)
+                    end
+                },
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:column {
+                spacing = 6,
+                f:static_text { title = "Runtime Details", width_in_chars = 40 },
+                f:static_text {
+                    title = "If Ollama is missing, the plugin can install it and download a vision model on the first Local AI run. The first run may take several minutes and several gigabytes of downloads.",
+                    width_in_chars = 95
+                },
+                f:static_text {
+                    title = "Temporary Lightroom JPEG previews are created only for the current AI run and are deleted afterward.",
+                    width_in_chars = 95
+                },
+                installSummary,
+            },
+
+            f:separator { fill_horizontal = 1 },
+
+            f:row {
+                spacing = 10,
+                f:push_button {
+                    title = uninstallButtonTitle,
+                    enabled = uninstallButtonTitle and true or false,
+                    action = function()
+                        if uninstallAction then
+                            uninstallAction()
+                        end
+                    end
+                },
+                f:static_text {
+                    title = "Use this only if you want to remove the Ollama runtime from your system.",
+                    width_in_chars = 65
+                },
+            },
+        }
+
         local result = LrDialogs.presentModalDialog {
             title = "Manage Local AI Runtime",
             contents = contents,
-            actionVerb = actionVerb or "Close",
-            cancelVerb = "Done"
+            actionVerb = "Save Settings",
+            cancelVerb = "Close"
         }
 
-        -- Validate and save suggestions per image
-        local suggestions = tonumber(props.defaultSuggestions)
-        if not suggestions then
-            suggestions = getConfiguredSuggestionsPerImage()
+        if result ~= "ok" then
+            return
         end
-        suggestions = math.max(1, math.min(30, math.floor(suggestions)))
 
-        -- Validate and save max photos per run
-        local maxPhotos = tonumber(props.maxPhotosPerRun)
-        if not maxPhotos then
-            maxPhotos = getConfiguredMaxPhotosPerRun()
-        end
-        maxPhotos = math.max(1, math.min(200, math.floor(maxPhotos)))
-
-        -- Persist all settings to preferences
-        prefs.aiDefaultSuggestionsPerImage = suggestions
-        prefs.aiMaxPhotosPerRun = maxPhotos
-        prefs.aiLowMemoryMode = props.lowMemoryMode and true or false
-        prefs.aiPreferCpu = props.preferCpu and true or false
-        prefs.aiBootstrapNoticeDismissed = props.showStartupNotice and true or false
-
-        -- Handle action button click
-        if result == "ok" then
-            if actionMode == "windows_uninstall" then
-                launchWindowsUninstaller(getWindowsPaths().uninstaller)
-            elseif actionMode == "mac_uninstall_help" then
-                showMacUninstallInstructions(getMacPaths())
-            end
-        end
+        local suggestions, maxPhotos, profile = saveRuntimeSettings(props)
+        local _, _, profileSummary = getProfileSettings(profile)
+        LrDialogs.message(
+            "Local AI settings saved",
+            "Suggestions per image: " .. tostring(suggestions) .. "\n" ..
+            "Max selected photos per run: " .. tostring(maxPhotos) .. "\n" ..
+            "Performance profile: " .. getProfileTitle(profile) .. "\n" ..
+            profileSummary,
+            "OK"
+        )
     end)
 end)
