@@ -11,6 +11,7 @@ local LrPrefs = import 'LrPrefs'
 -- ===== SAFE CACHE =====
 local keywordCache = {}
 local keywordPathCache = {}
+local safeKeywordCall
 
 local function trim(value)
     if value == nil then return nil end
@@ -154,11 +155,49 @@ local function detectWindows()
 end
 
 local IS_WINDOWS = detectWindows()
-local AI_MAX_PHOTOS_PER_RUN = 10
 local AI_COOLDOWN_SECONDS = 0.2
+local AI_DEFAULT_MAX_PHOTOS_PER_RUN = 10
 local AI_DEFAULT_SUGGESTIONS_PER_IMAGE = 10
+local AI_MAC_SAFE_MAX_PHOTOS_PER_RUN = 3
+local AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE = 6
 local prefs = LrPrefs.prefsForPlugin()
 local STYLE_PRESETS_DEFAULT = "Wedding=Event Type|Wedding;Portrait=Event Type|Portrait;Fine Art=Style|Fine Art"
+
+local function getConfiguredSuggestionsPerImage()
+    local n = tonumber(prefs.aiDefaultSuggestionsPerImage)
+    if not n then
+        n = AI_DEFAULT_SUGGESTIONS_PER_IMAGE
+    end
+    return math.max(1, math.min(30, math.floor(n)))
+end
+
+local function getConfiguredMaxPhotosPerRun()
+    local n = tonumber(prefs.aiMaxPhotosPerRun)
+    if not n then
+        n = AI_DEFAULT_MAX_PHOTOS_PER_RUN
+    end
+    return math.max(1, math.min(200, math.floor(n)))
+end
+
+local function seedPlatformAiDefaults()
+    if prefs.aiPlatformDefaultsInitialized then
+        return
+    end
+
+    if not IS_WINDOWS then
+        prefs.aiLowMemoryMode = true
+        prefs.aiPreferCpu = true
+        prefs.aiDefaultSuggestionsPerImage = AI_MAC_SAFE_SUGGESTIONS_PER_IMAGE
+        prefs.aiMaxPhotosPerRun = AI_MAC_SAFE_MAX_PHOTOS_PER_RUN
+    else
+        prefs.aiDefaultSuggestionsPerImage = AI_DEFAULT_SUGGESTIONS_PER_IMAGE
+        prefs.aiMaxPhotosPerRun = AI_DEFAULT_MAX_PHOTOS_PER_RUN
+    end
+
+    prefs.aiPlatformDefaultsInitialized = true
+end
+
+seedPlatformAiDefaults()
 
 local function shellQuotePosix(value)
     local s = tostring(value or '')
@@ -189,11 +228,11 @@ local function resolveLocalAiCommands()
         if IS_WINDOWS then
             local bridgePath = LrPathUtils.child(_PLUGIN.path, "OllamaKeywordBridge.cmd")
             return {
-                '"' .. bridgePath .. '" %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%',
+                '"' .. bridgePath .. '" %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS% %SETTINGS_FILE%',
             }
         else
             local bridgePath = LrPathUtils.child(_PLUGIN.path, "OllamaKeywordBridge.sh")
-            return { "/bin/zsh " .. shellQuotePosix(bridgePath) .. " %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS%" }
+            return { "/bin/zsh " .. shellQuotePosix(bridgePath) .. " %IMAGE_PATH% %HISTORY_FILE% %OUTPUT_FILE% %MAX_SUGGESTIONS% %SETTINGS_FILE%" }
         end
     end
 
@@ -242,6 +281,19 @@ local function appendTextFile(path, text)
     return true
 end
 
+local function writeSettingsFile(path, values)
+    local lines = {}
+    for key, value in pairs(values or {}) do
+        local k = clean(key)
+        local v = clean(value)
+        if k and v then
+            lines[#lines + 1] = k .. "=" .. v
+        end
+    end
+    table.sort(lines)
+    return writeTextFile(path, table.concat(lines, "\n"))
+end
+
 local function parseAiKeywordOutput(text)
     local words = {}
     local seen = {}
@@ -263,6 +315,100 @@ local function buildLocalAiNoOutputMessage()
         return "Local AI returned no keywords. Verify Ollama is installed, the Ollama app is running, and a vision model is available (for example llava:latest)."
     end
     return "Local AI returned no keywords. Verify Ollama is installed, running, and a vision model is available (for example llava:latest)."
+end
+
+local function getPhotoAttachedKeywordState(photo)
+    local state = {
+        paths = {},
+        leaves = {},
+        labels = {}
+    }
+
+    if not photo then
+        return state
+    end
+
+    local rawKeywords = nil
+    pcall(function()
+        rawKeywords = photo:getRawMetadata("keywords")
+    end)
+
+    for _, keyword in ipairs(rawKeywords or {}) do
+        local name = clean(safeKeywordCall(keyword, "getName"))
+        local fullPath = sanitizeHierarchyPath(safeKeywordCall(keyword, "getNameViaHierarchy")) or name
+        if fullPath then
+            state.paths[string.lower(fullPath)] = true
+        end
+        if name then
+            local key = string.lower(name)
+            if not state.leaves[key] then
+                state.leaves[key] = true
+                state.labels[#state.labels + 1] = name
+            end
+        end
+    end
+
+    if #state.labels == 0 then
+        local tagText = clean(photo:getFormattedMetadata("keywordTags"))
+        if tagText then
+            for token in tagText:gmatch("[^,\n\r;]+") do
+                local label = sanitizeSegment(token)
+                if label then
+                    local key = string.lower(label)
+                    if not state.leaves[key] then
+                        state.leaves[key] = true
+                        state.labels[#state.labels + 1] = label
+                    end
+                end
+            end
+        end
+    end
+
+    return state
+end
+
+local function isKeywordAlreadyAttached(path, attachedKeywordState)
+    if not attachedKeywordState or not path then
+        return false
+    end
+
+    local normalized = sanitizeHierarchyPath(path) or clean(path)
+    if not normalized then
+        return false
+    end
+
+    if attachedKeywordState.paths[string.lower(normalized)] then
+        return true
+    end
+
+    local leaf = normalized:match("([^|]+)$")
+    if leaf and attachedKeywordState.leaves[string.lower(leaf)] then
+        return true
+    end
+
+    return false
+end
+
+local function buildAiRuntimeSettings(aiSettings, attachedKeywordState)
+    local values = {}
+
+    if aiSettings and aiSettings.lowMemoryMode then
+        values.MODEL = "gemma3:4b"
+    end
+
+    if aiSettings and aiSettings.preferCpu then
+        values.CPU_ONLY = "true"
+    end
+
+    if attachedKeywordState and attachedKeywordState.labels and #attachedKeywordState.labels > 0 then
+        local labels = {}
+        for i = 1, math.min(#attachedKeywordState.labels, 40) do
+            labels[#labels + 1] = attachedKeywordState.labels[i]
+        end
+        values.EXISTING_KEYWORDS = table.concat(labels, ", ")
+    end
+
+    return values
 end
 
 local function renderAiThumbnail(photo)
@@ -311,7 +457,7 @@ function LocalAiSuggester.isConfigured()
     return LOCAL_AI_ENABLED and resolveLocalAiCommands() ~= nil
 end
 
-function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
+function LocalAiSuggester.suggest(photoOrPath, historyText, aiSettings)
     if not LocalAiSuggester.isConfigured() then
         return {}, 'Local AI disabled (set LOCAL_AI_ENABLED and LOCAL_AI_COMMAND in KeywordRunner.lua)'
     end
@@ -319,10 +465,12 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
     local imagePath = nil
     local imageCleanupPath = nil
     local imageError = nil
+    local attachedKeywordState = nil
 
     if type(photoOrPath) == "string" then
         imagePath = clean(photoOrPath)
     else
+        attachedKeywordState = getPhotoAttachedKeywordState(photoOrPath)
         imagePath, imageError = renderAiThumbnail(photoOrPath)
         imageCleanupPath = imagePath
     end
@@ -333,15 +481,22 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
 
     local historyFile = uniqueTempPath('lrkw_history', '.txt')
     local outputFile = uniqueTempPath('lrkw_ai_output', '.txt')
+    local settingsFile = uniqueTempPath('lrkw_ai_settings', '.txt')
     local debugFile = uniqueTempPath('lrkw_ai_debug', '.log')
     appendTextFile(debugFile, "IS_WINDOWS: " .. tostring(IS_WINDOWS) .. "\n")
     appendTextFile(debugFile, "PLUGIN_PATH: " .. tostring(_PLUGIN and _PLUGIN.path or "") .. "\n\n")
     if not writeTextFile(historyFile, tostring(historyText or '')) then
         return {}, "Failed to create temp history file for AI"
     end
+    if not writeSettingsFile(settingsFile, buildAiRuntimeSettings(aiSettings, attachedKeywordState)) then
+        deleteFile(imageCleanupPath)
+        deleteFile(historyFile)
+        deleteFile(outputFile)
+        return {}, "Failed to create AI settings file"
+    end
 
     local commandTemplates = resolveLocalAiCommands() or {}
-    local desiredCount = tonumber(maxSuggestions or AI_DEFAULT_SUGGESTIONS_PER_IMAGE) or AI_DEFAULT_SUGGESTIONS_PER_IMAGE
+    local desiredCount = tonumber(aiSettings and aiSettings.suggestionsPerImage or getConfiguredSuggestionsPerImage()) or getConfiguredSuggestionsPerImage()
     desiredCount = math.max(1, math.min(30, math.floor(desiredCount)))
     local exitCode = nil
     for _, template in ipairs(commandTemplates) do
@@ -350,6 +505,7 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
         cmd = cmd:gsub('%%HISTORY_FILE%%', commandQuote(historyFile))
         cmd = cmd:gsub('%%OUTPUT_FILE%%', commandQuote(outputFile))
         cmd = cmd:gsub('%%MAX_SUGGESTIONS%%', tostring(desiredCount))
+        cmd = cmd:gsub('%%SETTINGS_FILE%%', commandQuote(settingsFile))
         local candidates = { cmd }
         if IS_WINDOWS then
             candidates = { '"' .. cmd .. '"', cmd }
@@ -373,6 +529,7 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
         deleteFile(imageCleanupPath)
         deleteFile(historyFile)
         deleteFile(outputFile)
+        deleteFile(settingsFile)
         return {}, 'Local AI command failed with exit code ' .. tostring(exitCode) .. '. Debug log: ' .. tostring(debugFile)
     end
 
@@ -381,6 +538,7 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, maxSuggestions)
     deleteFile(imageCleanupPath)
     deleteFile(historyFile)
     deleteFile(outputFile)
+    deleteFile(settingsFile)
 
     if clean(outputText) == nil then
         deleteFile(debugFile)
@@ -513,7 +671,9 @@ local function promptAiSettings()
         local f = LrView.osFactory()
         local props = LrBinding.makePropertyTable(context)
 
-        props.suggestionsPerImage = tostring(AI_DEFAULT_SUGGESTIONS_PER_IMAGE)
+        props.suggestionsPerImage = tostring(getConfiguredSuggestionsPerImage())
+        props.lowMemoryMode = prefs.aiLowMemoryMode and true or false
+        props.preferCpu = prefs.aiPreferCpu and true or false
 
         local contents = f:column {
             bind_to_object = props,
@@ -524,7 +684,15 @@ local function promptAiSettings()
                 value = LrView.bind("suggestionsPerImage"),
                 width_in_chars = 6
             },
-            f:static_text { title = "Tip: start with 8-12 for stable results." }
+            f:checkbox {
+                title = "Low memory mode: prefer a smaller vision model for lower RAM use",
+                value = LrView.bind("lowMemoryMode")
+            },
+            f:checkbox {
+                title = "Prefer CPU when the plugin starts Ollama itself (slower, but lighter on GPU/unified memory)",
+                value = LrView.bind("preferCpu")
+            },
+            f:static_text { title = "Tip: start with 6-8 suggestions on low-memory systems, especially older Macs." }
         }
 
         local result = LrDialogs.presentModalDialog {
@@ -537,16 +705,67 @@ local function promptAiSettings()
         if result == "ok" then
             local n = tonumber(props.suggestionsPerImage)
             if not n then
-                n = AI_DEFAULT_SUGGESTIONS_PER_IMAGE
+                n = getConfiguredSuggestionsPerImage()
             end
             n = math.max(1, math.min(30, math.floor(n)))
+            prefs.aiLowMemoryMode = props.lowMemoryMode and true or false
+            prefs.aiPreferCpu = props.preferCpu and true or false
+            prefs.aiDefaultSuggestionsPerImage = n
             settings = {
-                suggestionsPerImage = n
+                suggestionsPerImage = n,
+                lowMemoryMode = prefs.aiLowMemoryMode,
+                preferCpu = prefs.aiPreferCpu
             }
         end
     end)
 
     return settings
+end
+
+local function promptAiBootstrapNotice()
+    if prefs.aiBootstrapNoticeDismissed then
+        return true
+    end
+
+    local shouldContinue = false
+
+    LrFunctionContext.callWithContext("aiBootstrapNoticeDialog", function(context)
+        local f = LrView.osFactory()
+        local props = LrBinding.makePropertyTable(context)
+        props.dontShowAgain = false
+
+        local contents = f:column {
+            bind_to_object = props,
+            spacing = 8,
+            f:static_text { title = "Local AI Setup", width_in_chars = 70 },
+            f:static_text { title = "If Ollama is not installed, this plugin will try to install it automatically from the official Ollama installer on first use.", width_in_chars = 90 },
+            f:static_text { title = "If no vision model is installed yet, it will also download a vision model such as llava:latest automatically.", width_in_chars = 90 },
+            f:static_text { title = "The first AI run can take several minutes and download multiple gigabytes depending on your connection and hardware.", width_in_chars = 90 },
+            f:static_text { title = "Internet access is required for the install/model download step.", width_in_chars = 90 },
+            f:static_text { title = "For privacy, the plugin sends Ollama only a temporary Lightroom JPEG preview stored in your system temp folder, then deletes it after the run.", width_in_chars = 90 },
+            f:static_text { title = "If you ever want to remove Ollama, use Library > Plug-in Extras > Manage Local AI Runtime.", width_in_chars = 90 },
+            f:checkbox {
+                title = "Don't show this setup notice again",
+                value = LrView.bind("dontShowAgain")
+            }
+        }
+
+        local result = LrDialogs.presentModalDialog {
+            title = "Local AI Setup",
+            contents = contents,
+            actionVerb = "Continue",
+            cancelVerb = "Cancel"
+        }
+
+        if result == "ok" then
+            if props.dontShowAgain then
+                prefs.aiBootstrapNoticeDismissed = true
+            end
+            shouldContinue = true
+        end
+    end)
+
+    return shouldContinue
 end
 
 local function parseStylePresetText(presetText)
@@ -646,7 +865,7 @@ local MAPPING_RULES = {
     rings = { name="Rings", parent="Details" },
 }
 
-local function safeKeywordCall(keyword, methodName)
+safeKeywordCall = function(keyword, methodName)
     if not keyword then return nil end
     local fn = keyword[methodName]
     if type(fn) ~= "function" then
@@ -818,10 +1037,11 @@ local function collectKeywordLearningProfile(photos)
     return table.concat(top, ", ")
 end
 
-local function addKeywordPath(list, set, path)
+local function addKeywordPath(list, set, path, attachedKeywordState)
     path = clean(path)
     if not path then return end
     if set[path] then return end
+    if isKeywordAlreadyAttached(path, attachedKeywordState) then return end
 
     set[path] = true
     list[#list + 1] = path
@@ -863,16 +1083,17 @@ local function resolveWordToPath(word, existingKeywordIndex, categoryMap, unknow
     return category .. "|" .. cleanWord
 end
 
-local function addMappedOrCategorizedPath(paths, pathSet, word, existingKeywordIndex, categoryMap, unknownSet)
+local function addMappedOrCategorizedPath(paths, pathSet, word, existingKeywordIndex, categoryMap, unknownSet, attachedKeywordState)
     local path = resolveWordToPath(word, existingKeywordIndex, categoryMap, unknownSet)
     if path then
-        addKeywordPath(paths, pathSet, path)
+        addKeywordPath(paths, pathSet, path, attachedKeywordState)
     end
 end
 
 local function collectKeywordPathsForPhoto(photo, mode, stylePaths, quickTags, aiKeywords, existingKeywordIndex, categoryMap, unknownSet)
     local paths = {}
     local pathSet = {}
+    local attachedKeywordState = getPhotoAttachedKeywordState(photo)
 
     local data = {
         dateInfo = getDateInfo(photo),
@@ -881,20 +1102,20 @@ local function collectKeywordPathsForPhoto(photo, mode, stylePaths, quickTags, a
     }
 
     if data.camera then
-        addKeywordPath(paths, pathSet, "Camera|" .. data.camera)
+        addKeywordPath(paths, pathSet, "Camera|" .. data.camera, attachedKeywordState)
     end
 
     if data.dateInfo then
-        addKeywordPath(paths, pathSet, "Date|" .. tostring(data.dateInfo.year) .. "|" .. tostring(data.dateInfo.monthName))
+        addKeywordPath(paths, pathSet, "Date|" .. tostring(data.dateInfo.year) .. "|" .. tostring(data.dateInfo.monthName), attachedKeywordState)
 
         local season = getSeason(data.dateInfo.monthNumber)
         if season then
-            addKeywordPath(paths, pathSet, "Season|" .. season)
+            addKeywordPath(paths, pathSet, "Season|" .. season, attachedKeywordState)
         end
     end
 
     if data.lens then
-        addKeywordPath(paths, pathSet, "Lens|" .. data.lens)
+        addKeywordPath(paths, pathSet, "Lens|" .. data.lens, attachedKeywordState)
     end
 
     if mode == "camera_only" then
@@ -903,18 +1124,18 @@ local function collectKeywordPathsForPhoto(photo, mode, stylePaths, quickTags, a
 
     if quickTags then
         for word in tostring(quickTags):gmatch("[^,%s;]+") do
-            addMappedOrCategorizedPath(paths, pathSet, word, existingKeywordIndex, categoryMap, unknownSet)
+            addMappedOrCategorizedPath(paths, pathSet, word, existingKeywordIndex, categoryMap, unknownSet, attachedKeywordState)
         end
     end
 
     if mode == "ai_local" and aiKeywords and #aiKeywords > 0 then
         for _, aiWord in ipairs(aiKeywords) do
-            addMappedOrCategorizedPath(paths, pathSet, aiWord, existingKeywordIndex, categoryMap, unknownSet)
+            addMappedOrCategorizedPath(paths, pathSet, aiWord, existingKeywordIndex, categoryMap, unknownSet, attachedKeywordState)
         end
     end
 
     for _, stylePath in ipairs(stylePaths or {}) do
-        addKeywordPath(paths, pathSet, stylePath)
+        addKeywordPath(paths, pathSet, stylePath, attachedKeywordState)
     end
 
     return paths
@@ -994,6 +1215,10 @@ LrTasks.startAsyncTask(function()
 
     local aiSettings = nil
     if mode == "ai_local" then
+        if not promptAiBootstrapNotice() then
+            LrDialogs.message("Keywording canceled")
+            return
+        end
         aiSettings = promptAiSettings()
         if not aiSettings then
             LrDialogs.message("Keywording canceled")
@@ -1032,10 +1257,11 @@ LrTasks.startAsyncTask(function()
         return
     end
 
-    if mode == "ai_local" and #photos > AI_MAX_PHOTOS_PER_RUN then
+    local maxPhotosPerRun = getConfiguredMaxPhotosPerRun()
+    if mode == "ai_local" and #photos > maxPhotosPerRun then
         LrDialogs.message(
             "AI safety limit reached",
-            "AI Assist is limited to " .. tostring(AI_MAX_PHOTOS_PER_RUN) .. " photos per run to protect system stability. Please select fewer photos.",
+            "AI Assist is limited to " .. tostring(maxPhotosPerRun) .. " photos per run to protect system stability. Please select fewer photos or raise the limit in Manage Local AI Runtime.",
             "OK"
         )
         return
@@ -1093,7 +1319,7 @@ LrTasks.startAsyncTask(function()
         if mode == "ai_local" then
             local aiErr = nil
             local aiKeywords = nil
-            aiKeywords, aiErr = LocalAiSuggester.suggest(photo, aiProfile, aiSettings and aiSettings.suggestionsPerImage)
+            aiKeywords, aiErr = LocalAiSuggester.suggest(photo, aiProfile, aiSettings)
             aiKeywordsByPhoto[i] = aiKeywords or {}
             if aiErr and not firstAiError then
                 firstAiError = aiErr

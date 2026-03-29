@@ -14,5 +14,9 @@ return {
             title = "Manage Style Presets",
             file = "MenuEntry.lua",
         },
+        {
+            title = "Manage Local AI Runtime",
+            file = "LocalAiRuntimeManager.lua",
+        },
     },
 }

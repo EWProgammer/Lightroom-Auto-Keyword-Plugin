@@ -2,7 +2,8 @@ param(
     [string]$ImagePath,
     [string]$HistoryFile,
     [string]$OutputFile,
-    [int]$MaxSuggestions = 10
+    [int]$MaxSuggestions = 10,
+    [string]$SettingsFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,29 @@ function Write-EmptyOutput {
     if (-not [string]::IsNullOrWhiteSpace($Path)) {
         Set-Content -Path $Path -Value '' -NoNewline
     }
+}
+
+function Load-BridgeSettings {
+    param([string]$Path)
+
+    $settings = @{}
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+        return $settings
+    }
+
+    foreach ($line in Get-Content -Path $Path) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -notmatch '=') {
+            continue
+        }
+        $parts = $line -split '=', 2
+        $key = $parts[0].Trim()
+        $value = if ($parts.Length -gt 1) { $parts[1].Trim() } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            $settings[$key] = $value
+        }
+    }
+
+    return $settings
 }
 
 function Resolve-OllamaBin {
@@ -39,6 +63,90 @@ function Resolve-OllamaBin {
     return $null
 }
 
+function Resolve-OllamaHost {
+    $ollamaHost = if ([string]::IsNullOrWhiteSpace($env:OLLAMA_HOST)) { 'http://127.0.0.1:11434' } else { $env:OLLAMA_HOST }
+    if ($ollamaHost -notmatch '^https?://') {
+        $ollamaHost = 'http://' + $ollamaHost
+    }
+    return $ollamaHost.TrimEnd('/')
+}
+
+function Test-OllamaApi {
+    param([string]$OllamaHost)
+
+    if ([string]::IsNullOrWhiteSpace($OllamaHost)) {
+        return $false
+    }
+
+    try {
+        Invoke-RestMethod -Uri ($OllamaHost + '/api/tags') -Method Get -TimeoutSec 5 *> $null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Wait-OllamaApi {
+    param(
+        [string]$OllamaHost,
+        [int]$Seconds = 60
+    )
+
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        if (Test-OllamaApi -OllamaHost $OllamaHost) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    return $false
+}
+
+function Install-OllamaWindows {
+    try {
+        $installerScript = Invoke-RestMethod -Uri 'https://ollama.com/install.ps1'
+        Invoke-Expression $installerScript
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-OllamaReady {
+    param([hashtable]$BridgeSettings)
+
+    $ollamaBin = Resolve-OllamaBin
+    if ([string]::IsNullOrWhiteSpace($ollamaBin)) {
+        if (-not (Install-OllamaWindows)) {
+            return $null
+        }
+        $ollamaBin = Resolve-OllamaBin
+        if ([string]::IsNullOrWhiteSpace($ollamaBin)) {
+            return $null
+        }
+    }
+
+    $ollamaHost = Resolve-OllamaHost
+    if (-not (Test-OllamaApi -OllamaHost $ollamaHost)) {
+        try {
+            if ($BridgeSettings['CPU_ONLY'] -eq 'true') {
+                $env:OLLAMA_LLM_LIBRARY = 'cpu'
+            }
+            Start-Process -FilePath $ollamaBin -ArgumentList 'serve' -WindowStyle Hidden | Out-Null
+        } catch {
+        }
+    }
+
+    if (-not (Wait-OllamaApi -OllamaHost $ollamaHost -Seconds 60)) {
+        return $null
+    }
+
+    return @{
+        Bin = $ollamaBin
+        Host = $ollamaHost
+    }
+}
+
 function Test-OllamaModel {
     param(
         [string]$OllamaBin,
@@ -58,16 +166,40 @@ function Test-OllamaModel {
 }
 
 function Resolve-OllamaModel {
-    param([string]$OllamaBin)
+    param(
+        [string]$OllamaBin,
+        [string]$OllamaHost,
+        [hashtable]$BridgeSettings
+    )
 
-    if (Test-OllamaModel -OllamaBin $OllamaBin -Model $env:OLLAMA_MODEL) {
-        return $env:OLLAMA_MODEL
+    $preferredModel = if (-not [string]::IsNullOrWhiteSpace($BridgeSettings['MODEL'])) { $BridgeSettings['MODEL'] } elseif ([string]::IsNullOrWhiteSpace($env:OLLAMA_MODEL)) { 'llava:latest' } else { $env:OLLAMA_MODEL }
+
+    if (Test-OllamaModel -OllamaBin $OllamaBin -Model $preferredModel) {
+        return $preferredModel
     }
 
     foreach ($candidate in @('llava:latest', 'llava:7b', 'gemma3:4b')) {
         if (Test-OllamaModel -OllamaBin $OllamaBin -Model $candidate) {
             return $candidate
         }
+    }
+
+    try {
+        $pullBody = @{
+            name   = $preferredModel
+            stream = $false
+        } | ConvertTo-Json -Depth 3 -Compress
+
+        Invoke-RestMethod -Uri ($OllamaHost + '/api/pull') -Method Post -ContentType 'application/json' -Body $pullBody -TimeoutSec 1800 *> $null
+    } catch {
+        try {
+            & $OllamaBin pull $preferredModel *> $null
+        } catch {
+        }
+    }
+
+    if (Test-OllamaModel -OllamaBin $OllamaBin -Model $preferredModel) {
+        return $preferredModel
     }
 
     return $null
@@ -79,21 +211,19 @@ try {
         exit 0
     }
 
-    $ollamaBin = Resolve-OllamaBin
-    if ([string]::IsNullOrWhiteSpace($ollamaBin)) {
+    $bridgeSettings = Load-BridgeSettings -Path $SettingsFile
+    $ollama = Ensure-OllamaReady -BridgeSettings $bridgeSettings
+    if ($null -eq $ollama) {
         Write-EmptyOutput -Path $OutputFile
         exit 0
     }
 
-    $model = Resolve-OllamaModel -OllamaBin $ollamaBin
+    $ollamaBin = $ollama.Bin
+    $ollamaHost = $ollama.Host
+    $model = Resolve-OllamaModel -OllamaBin $ollamaBin -OllamaHost $ollamaHost -BridgeSettings $bridgeSettings
     if ([string]::IsNullOrWhiteSpace($model)) {
         Write-EmptyOutput -Path $OutputFile
         exit 0
-    }
-
-    $ollamaHost = if ([string]::IsNullOrWhiteSpace($env:OLLAMA_HOST)) { 'http://127.0.0.1:11434' } else { $env:OLLAMA_HOST }
-    if ($ollamaHost -notmatch '^https?://') {
-        $ollamaHost = 'http://' + $ollamaHost
     }
 
     $historyText = ''
@@ -110,6 +240,9 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($historyText)) {
         $promptParts += "If relevant, align with this historical keyword style: $historyText"
     }
+    if (-not [string]::IsNullOrWhiteSpace($bridgeSettings['EXISTING_KEYWORDS'])) {
+        $promptParts += "Do not repeat keywords already attached to this photo: $($bridgeSettings['EXISTING_KEYWORDS'])"
+    }
 
     $promptParts += 'Return keywords only.'
     $prompt = $promptParts -join ' '
@@ -123,7 +256,7 @@ try {
         images = @($imageBase64)
     } | ConvertTo-Json -Depth 5 -Compress
 
-    $response = Invoke-RestMethod -Uri ($ollamaHost.TrimEnd('/') + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300
+    $response = Invoke-RestMethod -Uri ($ollamaHost + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300
     $text = [string]$response.response
     $text = $text -replace '[\r\n;]+', ', '
     $text = $text -replace '\s+', ' '
