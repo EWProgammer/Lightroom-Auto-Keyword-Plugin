@@ -14,6 +14,7 @@ CPU_ONLY=""
 EXISTING_KEYWORDS=""
 NUM_CTX="2048"
 KEEP_ALIVE="10m"
+PID_FILE="${TMPDIR:-/tmp}/lrkw_ollama_started_by_plugin.pid"
 
 if [[ "$OLLAMA_HOST_VALUE" != http://* && "$OLLAMA_HOST_VALUE" != https://* ]]; then
   OLLAMA_HOST_VALUE="http://${OLLAMA_HOST_VALUE}"
@@ -27,6 +28,15 @@ fi
 
 install_ollama() {
   curl -fsSL https://ollama.com/install.sh | sh >/dev/null 2>&1
+}
+
+record_started_pid() {
+  local pid="$1"
+  local started_at=""
+
+  [[ -n "$pid" ]] || return 0
+  started_at="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
+  printf '%s|%s\n' "$pid" "$started_at" > "$PID_FILE"
 }
 
 json_escape() {
@@ -82,6 +92,7 @@ if ! curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
   else
     nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
   fi
+  record_started_pid "$!"
 
   for _ in {1..60}; do
     if curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
