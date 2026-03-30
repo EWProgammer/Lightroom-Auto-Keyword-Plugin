@@ -89,8 +89,40 @@ local function cleanupMacOllama()
     LrTasks.execute("/bin/sh -lc " .. shellQuotePosix(script))
 end
 
+local function cleanupWindowsOllama()
+    local tempDir = os.getenv("TEMP") or os.getenv("TMP") or ""
+    if not trim(tempDir) then
+        return
+    end
+
+    local pidFile = tempDir .. "\\lrkw_ollama_started_by_plugin.pid"
+    local payload = trim(readTextFile(pidFile))
+
+    if not payload then
+        return
+    end
+
+    local pid = payload:match("^(%d+)")
+    if not pid then
+        pcall(function() os.remove(pidFile) end)
+        return
+    end
+
+    pcall(function()
+        LrTasks.execute('tasklist /FI "PID eq ' .. pid .. '" /FO CSV /NH')
+    end)
+
+    pcall(function()
+        LrTasks.execute('taskkill /PID ' .. pid .. ' /T /F')
+    end)
+
+    pcall(function() os.remove(pidFile) end)
+end
+
 pcall(function()
-    if not detectWindows() then
+    if detectWindows() then
+        cleanupWindowsOllama()
+    else
         cleanupMacOllama()
     end
 end)

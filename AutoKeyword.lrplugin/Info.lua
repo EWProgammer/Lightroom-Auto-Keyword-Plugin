@@ -52,7 +52,7 @@ return {
     LrShutdownApp = "PluginShutdown.lua",
     
     -- Current plugin version (major.minor.revision.build format)
-    VERSION = { major=1, minor=4, revision=2, build=8 },
+    VERSION = { major=1, minor=4, revision=2, build=9 },
 
     -- Menu items added to Lightroom's Library module
     LrLibraryMenuItems = menuItems,

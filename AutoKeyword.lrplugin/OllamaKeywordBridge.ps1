@@ -149,6 +149,21 @@ function Install-OllamaWindows {
     }
 }
 
+function Save-ProcessPid {
+    param(
+        [int]$ProcessId,
+        [string]$FilePath
+    )
+
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $pidFile = Join-Path $tempDir 'lrkw_ollama_started_by_plugin.pid'
+    
+    try {
+        Set-Content -Path $pidFile -Value $ProcessId -NoNewline
+    } catch {
+    }
+}
+
 function Ensure-OllamaReady {
     param([hashtable]$BridgeSettings)
 
@@ -169,7 +184,10 @@ function Ensure-OllamaReady {
             if ($BridgeSettings['CPU_ONLY'] -eq 'true') {
                 $env:OLLAMA_LLM_LIBRARY = 'cpu'
             }
-            Start-Process -FilePath $ollamaBin -ArgumentList 'serve' -WindowStyle Hidden | Out-Null
+            $process = Start-Process -FilePath $ollamaBin -ArgumentList 'serve' -WindowStyle Hidden -PassThru
+            if ($process) {
+                Save-ProcessPid -ProcessId $process.Id
+            }
         } catch {
         }
     }
