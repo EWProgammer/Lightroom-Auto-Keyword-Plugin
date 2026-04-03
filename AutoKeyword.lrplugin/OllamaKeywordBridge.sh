@@ -1,4 +1,29 @@
 #!/bin/zsh
+
+# =========================
+# SINGLE INSTANCE LOCK FIX
+# =========================
+
+LOCK_FILE="${TMPDIR:-/tmp}/lrkw_ollama.lock"
+
+# If lock exists, skip starting Ollama
+if [[ -f "$LOCK_FILE" ]]; then
+  :
+else
+  # Check if Ollama already running
+  if ! pgrep -x "ollama" >/dev/null 2>&1; then
+    if [[ "$CPU_ONLY" == "true" ]]; then
+      OLLAMA_LLM_LIBRARY="cpu" nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
+    else
+      nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
+    fi
+
+    record_started_pid "$!"
+
+    # Create lock file
+    echo "$!" > "$LOCK_FILE"
+  fi
+fi
 set -euo pipefail
 
 IMAGE_PATH="${1:-}"
@@ -14,7 +39,7 @@ CPU_ONLY=""
 EXISTING_KEYWORDS=""
 NUM_CTX="2048"
 KEEP_ALIVE="10m"
-PID_FILE="/tmp/lrkw_ollama_started_by_plugin.pid"
+PID_FILE="${TMPDIR:-/tmp}/lrkw_ollama_started_by_plugin.pid"
 
 if [[ "$OLLAMA_HOST_VALUE" != http://* && "$OLLAMA_HOST_VALUE" != https://* ]]; then
   OLLAMA_HOST_VALUE="http://${OLLAMA_HOST_VALUE}"
@@ -38,83 +63,6 @@ record_started_pid() {
   [[ -n "$pid" ]] || return 0
   started_at="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
   printf '%s|%s\n' "$pid" "$started_at" > "$PID_FILE"
-}
-
-find_running_ollama_pid() {
-  pgrep -f "ollama serve" 2>/dev/null | head -n 1
-}
-
-find_lightroom_pid() {
-  local current="$$"
-  local name=""
-  local parent=""
-
-  for _ in {1..12}; do
-    [[ -n "$current" && "$current" != "0" ]] || break
-    name="$(ps -p "$current" -o comm= 2>/dev/null | sed 's/^ *//')"
-    case "$name" in
-      *Lightroom*|*lightroom*)
-        printf '%s\n' "$current"
-        return 0
-        ;;
-    esac
-
-    parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d '[:space:]')"
-    current="$parent"
-  done
-
-  return 1
-}
-
-launch_watchdog() {
-  local lightroom_pid="$1"
-  local ollama_pid="$2"
-  local expected_start="$3"
-
-  [[ -n "$lightroom_pid" && -n "$ollama_pid" ]] || return 0
-
-  nohup /bin/sh -c '
-    LR_PID="$1"
-    OLLAMA_PID="$2"
-    EXPECTED_START="$3"
-    PID_FILE="$4"
-    i=0
-    while [ "$i" -lt 1800 ]; do
-      kill -0 "$LR_PID" >/dev/null 2>&1 || break
-      sleep 2
-      i=$((i + 1))
-    done
-
-    if kill -0 "$OLLAMA_PID" >/dev/null 2>&1; then
-      CURRENT_COMMAND="$(ps -p "$OLLAMA_PID" -o command= 2>/dev/null)"
-      CURRENT_START="$(ps -p "$OLLAMA_PID" -o lstart= 2>/dev/null | sed '"'"'s/^ *//'"'"')"
-      case "$CURRENT_COMMAND" in
-        *"ollama serve"*)
-          if [ -z "$EXPECTED_START" ] || [ "$CURRENT_START" = "$EXPECTED_START" ]; then
-            kill "$OLLAMA_PID" >/dev/null 2>&1 || true
-            sleep 1
-            kill -0 "$OLLAMA_PID" >/dev/null 2>&1 && kill -9 "$OLLAMA_PID" >/dev/null 2>&1 || true
-          fi
-          ;;
-      esac
-    fi
-
-    rm -f "$PID_FILE"
-  ' sh "$lightroom_pid" "$ollama_pid" "$expected_start" "$PID_FILE" >/dev/null 2>&1 &
-}
-
-adopt_running_ollama_for_session() {
-  local ollama_pid=""
-  local started_at=""
-  local lightroom_pid=""
-
-  ollama_pid="$(find_running_ollama_pid || true)"
-  [[ -n "$ollama_pid" ]] || return 0
-
-  started_at="$(ps -p "$ollama_pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
-  printf '%s|%s\n' "$ollama_pid" "$started_at" > "$PID_FILE"
-  lightroom_pid="$(find_lightroom_pid || true)"
-  launch_watchdog "$lightroom_pid" "$ollama_pid" "$started_at"
 }
 
 json_escape() {
@@ -165,21 +113,13 @@ if [[ -z "$OLLAMA_BIN" ]]; then
   exit 1
 fi
 
-if curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
-  adopt_running_ollama_for_session
-fi
-
 if ! curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
   if [[ "$CPU_ONLY" == "true" ]]; then
     OLLAMA_LLM_LIBRARY="cpu" nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
   else
     nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
   fi
-  OLLAMA_STARTED_PID="$!"
-  record_started_pid "$OLLAMA_STARTED_PID"
-  OLLAMA_STARTED_AT="$(ps -p "$OLLAMA_STARTED_PID" -o lstart= 2>/dev/null | sed 's/^ *//')"
-  LIGHTROOM_PID="$(find_lightroom_pid || true)"
-  launch_watchdog "$LIGHTROOM_PID" "$OLLAMA_STARTED_PID" "$OLLAMA_STARTED_AT"
+  record_started_pid "$!"
 
   for _ in {1..180}; do
     if curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
