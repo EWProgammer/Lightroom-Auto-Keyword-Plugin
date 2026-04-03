@@ -46,13 +46,9 @@ return {
     
     -- Entry point script executed when plugin initializes
     LrInitPlugin = "PluginInit.lua",
-
-    -- Cleanup hook executed when the plugin or Lightroom shuts down
-    LrShutdownPlugin = "PluginShutdown.lua",
-    LrShutdownApp = "PluginShutdown.lua",
     
     -- Current plugin version (major.minor.revision.build format)
-    VERSION = { major=1, minor=4, revision=2, build=9 },
+    VERSION = { major=1, minor=5, revision=1, build=0 },
 
     -- Menu items added to Lightroom's Library module
     LrLibraryMenuItems = menuItems,

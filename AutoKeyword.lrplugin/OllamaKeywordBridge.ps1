@@ -40,6 +40,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$DebugFile = Join-Path ([System.IO.Path]::GetTempPath()) "lrkw_ps_debug_$([datetime]::Now.Ticks).log"
+
+function Write-DebugLog {
+    param([string]$Message)
+    Add-Content -Path $DebugFile -Value $Message
+}
+
+Write-DebugLog "=== OllamaKeywordBridge.ps1 Started ==="
+Write-DebugLog "ImagePath: $ImagePath"
+Write-DebugLog "HistoryFile: $HistoryFile"
+Write-DebugLog "OutputFile: $OutputFile"
+Write-DebugLog "MaxSuggestions: $MaxSuggestions"
+Write-DebugLog "SettingsFile: $SettingsFile"
+Write-DebugLog ""
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -88,11 +102,14 @@ function Resolve-OllamaBin {
 
     $candidates = @(
         'C:\Program Files\Ollama\ollama.exe',
-        (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe')
+        'C:\Program Files (x86)\Ollama\ollama.exe',
+        (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'),
+        (Join-Path $env:USERPROFILE 'AppData\Local\Programs\Ollama\ollama.exe')
     )
 
     foreach ($candidate in $candidates) {
         if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path $candidate)) {
+            Write-DebugLog "Found Ollama at: $candidate"
             return $candidate
         }
     }
@@ -126,7 +143,7 @@ function Test-OllamaApi {
 function Wait-OllamaApi {
     param(
         [string]$OllamaHost,
-        [int]$Seconds = 60
+        [int]$Seconds = 120
     )
 
     for ($i = 0; $i -lt $Seconds; $i++) {
@@ -152,15 +169,118 @@ function Install-OllamaWindows {
 function Save-ProcessPid {
     param(
         [int]$ProcessId,
-        [string]$FilePath
+        [string]$StartedAt
     )
 
     $tempDir = [System.IO.Path]::GetTempPath()
     $pidFile = Join-Path $tempDir 'lrkw_ollama_started_by_plugin.pid'
     
     try {
-        Set-Content -Path $pidFile -Value $ProcessId -NoNewline
+        $payload = if ([string]::IsNullOrWhiteSpace($StartedAt)) { [string]$ProcessId } else { "$ProcessId|$StartedAt" }
+        Set-Content -Path $pidFile -Value $payload -NoNewline
     } catch {
+    }
+}
+
+function Get-ParentProcessId {
+    param([int]$ProcessId)
+
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        return [int]$proc.ParentProcessId
+    } catch {
+        return 0
+    }
+}
+
+function Resolve-LightroomProcessId {
+    $currentPid = $PID
+
+    for ($i = 0; $i -lt 12 -and $currentPid -gt 0; $i++) {
+        try {
+            $proc = Get-Process -Id $currentPid -ErrorAction Stop
+            if ($proc.ProcessName -match '(?i)lightroom') {
+                return $proc.Id
+            }
+        } catch {
+        }
+
+        $currentPid = Get-ParentProcessId -ProcessId $currentPid
+    }
+
+    return 0
+}
+
+function Get-ProcessStartMarker {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) {
+        return ''
+    }
+
+    try {
+        return $Process.StartTime.ToUniversalTime().ToString('o')
+    } catch {
+        return ''
+    }
+}
+
+function Start-OllamaWatchdog {
+    param([int]$LightroomPid)
+
+    $watchdogPath = Join-Path $PSScriptRoot 'OllamaWatchdog.ps1'
+    if (-not (Test-Path $watchdogPath)) {
+        Write-DebugLog "Watchdog script not found at $watchdogPath"
+        return
+    }
+
+    try {
+        Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $watchdogPath,
+            '-LightroomPID', ([string]$LightroomPid)
+        ) | Out-Null
+        Write-DebugLog "Started watchdog from $watchdogPath for Lightroom PID $LightroomPid"
+    } catch {
+        Write-DebugLog "Failed to start watchdog: $_"
+    }
+}
+
+function Kill-AllOllamaProcesses {
+    try {
+        $processes = Get-Process ollama -ErrorAction SilentlyContinue
+        if ($processes) {
+            Write-DebugLog "Found $($processes.Count) Ollama process(es) to clean up"
+            foreach ($proc in $processes) {
+                try {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                    Write-DebugLog "Killed Ollama process PID $($proc.Id)"
+                } catch {
+                    Write-DebugLog "Failed to kill PID $($proc.Id): $_"
+                }
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    } catch {
+        Write-DebugLog "Error checking for existing Ollama processes: $_"
+    }
+}
+
+function Test-OllamaInstallation {
+    param([string]$OllamaBin)
+
+    if ([string]::IsNullOrWhiteSpace($OllamaBin)) {
+        return $false
+    }
+
+    try {
+        $output = & $OllamaBin --version 2>&1
+        Write-DebugLog "Ollama version check: $output"
+        return $LASTEXITCODE -eq 0
+    } catch {
+        Write-DebugLog "Ollama version check failed: $_"
+        return $false
     }
 }
 
@@ -169,33 +289,72 @@ function Ensure-OllamaReady {
 
     $ollamaBin = Resolve-OllamaBin
     if ([string]::IsNullOrWhiteSpace($ollamaBin)) {
+        Write-DebugLog "Ollama not found, attempting installation..."
         if (-not (Install-OllamaWindows)) {
+            Write-DebugLog "Ollama installation failed"
             return $null
         }
         $ollamaBin = Resolve-OllamaBin
         if ([string]::IsNullOrWhiteSpace($ollamaBin)) {
+            Write-DebugLog "Ollama still not found after installation attempt"
             return $null
         }
     }
 
-    $ollamaHost = Resolve-OllamaHost
-    if (-not (Test-OllamaApi -OllamaHost $ollamaHost)) {
-        try {
-            if ($BridgeSettings['CPU_ONLY'] -eq 'true') {
-                $env:OLLAMA_LLM_LIBRARY = 'cpu'
-            }
-            $process = Start-Process -FilePath $ollamaBin -ArgumentList 'serve' -WindowStyle Hidden -PassThru
-            if ($process) {
-                Save-ProcessPid -ProcessId $process.Id
-            }
-        } catch {
-        }
-    }
-
-    if (-not (Wait-OllamaApi -OllamaHost $ollamaHost -Seconds 60)) {
+    # Verify the Ollama installation is valid
+    if (-not (Test-OllamaInstallation -OllamaBin $ollamaBin)) {
+        Write-DebugLog "Ollama installation verification failed at: $ollamaBin"
         return $null
     }
 
+    Write-DebugLog "Using Ollama binary: $ollamaBin"
+
+    $ollamaHost = Resolve-OllamaHost
+    Write-DebugLog "Using Ollama host: $ollamaHost"
+    
+    # Check if Ollama API is already responding
+    if (Test-OllamaApi -OllamaHost $ollamaHost) {
+        Write-DebugLog "Ollama is already running and responding"
+        Start-OllamaWatchdog -LightroomPid (Resolve-LightroomProcessId)
+        return @{
+            Bin = $ollamaBin
+            Host = $ollamaHost
+        }
+    }
+
+    # API not responding, kill any stale processes and start fresh
+    Write-DebugLog "Ollama API not responding, cleaning up stale processes..."
+    Kill-AllOllamaProcesses
+
+    # Ollama is not responding, try to start it
+    Write-DebugLog "Starting Ollama serve..."
+    try {
+        if ($BridgeSettings['CPU_ONLY'] -eq 'true') {
+            $env:OLLAMA_LLM_LIBRARY = 'cpu'
+            Write-DebugLog "CPU_ONLY mode enabled"
+        }
+        $process = Start-Process -FilePath $ollamaBin -ArgumentList 'serve' -WindowStyle Hidden -PassThru -ErrorAction Stop
+        if ($process) {
+            Write-DebugLog "Ollama started with PID $($process.Id)"
+            $lightroomPid = Resolve-LightroomProcessId
+            $startedAt = Get-ProcessStartMarker -Process $process
+            Save-ProcessPid -ProcessId $process.Id -StartedAt $startedAt
+            Start-OllamaWatchdog -LightroomPid $lightroomPid
+            Start-Sleep -Seconds 1
+        }
+    } catch {
+        Write-DebugLog "Failed to start Ollama: $_"
+        return $null
+    }
+
+    # Wait for Ollama API to become available (up to 180 seconds - longer for first startup with potential model download)
+    Write-DebugLog "Waiting for Ollama API to be ready (up to 180 seconds)..."
+    if (-not (Wait-OllamaApi -OllamaHost $ollamaHost -Seconds 180)) {
+        Write-DebugLog "ERROR: Ollama API failed to become ready within 180 seconds"
+        return $null
+    }
+
+    Write-DebugLog "Ollama is ready"
     return @{
         Bin = $ollamaBin
         Host = $ollamaHost
@@ -262,28 +421,43 @@ function Resolve-OllamaModel {
 
 try {
     if ([string]::IsNullOrWhiteSpace($ImagePath) -or [string]::IsNullOrWhiteSpace($OutputFile)) {
+        Write-DebugLog "ERROR: Missing required parameters (IMAGE_PATH or OUTPUT_FILE)"
         Write-EmptyOutput -Path $OutputFile
-        exit 0
+        exit 1
     }
 
+    Write-DebugLog "Loading bridge settings..."
     $bridgeSettings = Load-BridgeSettings -Path $SettingsFile
+    Write-DebugLog "Ensuring Ollama is ready..."
     $ollama = Ensure-OllamaReady -BridgeSettings $bridgeSettings
     if ($null -eq $ollama) {
+        Write-DebugLog "ERROR: Ollama failed to start or is not available"
         Write-EmptyOutput -Path $OutputFile
-        exit 0
+        Write-Error "Ollama failed to start or is not available"
+        exit 1
     }
 
     $ollamaBin = $ollama.Bin
     $ollamaHost = $ollama.Host
+    Write-DebugLog "Ollama ready at: $ollamaHost"
+    
+    Write-DebugLog "Resolving model..."
     $model = Resolve-OllamaModel -OllamaBin $ollamaBin -OllamaHost $ollamaHost -BridgeSettings $bridgeSettings
     if ([string]::IsNullOrWhiteSpace($model)) {
+        Write-DebugLog "ERROR: No valid Ollama model available"
         Write-EmptyOutput -Path $OutputFile
-        exit 0
+        Write-Error "No valid Ollama model available. Tried: llava:latest, llava:7b, gemma3:4b"
+        exit 1
     }
 
+    Write-DebugLog "Model: $model"
     $historyText = ''
     if (-not [string]::IsNullOrWhiteSpace($HistoryFile) -and (Test-Path $HistoryFile)) {
-        $historyText = (Get-Content -Path $HistoryFile -Raw).Trim()
+        $historyRaw = Get-Content -Path $HistoryFile -Raw -ErrorAction SilentlyContinue
+        if ($null -ne $historyRaw) {
+            $historyText = [string]$historyRaw
+            $historyText = $historyText.Trim()
+        }
     }
 
     $promptParts = @(
@@ -302,8 +476,23 @@ try {
     $promptParts += 'Return keywords only.'
     $prompt = $promptParts -join ' '
 
+    Write-DebugLog "Reading image: $ImagePath"
+    if (-not (Test-Path $ImagePath)) {
+        Write-DebugLog "ERROR: Image file not found"
+        Write-EmptyOutput -Path $OutputFile
+        Write-Error "Image file not found: $ImagePath"
+        exit 1
+    }
+    
     $imageBytes = [System.IO.File]::ReadAllBytes($ImagePath)
+    Write-DebugLog "Image file size: $($imageBytes.Length) bytes"
+    
     $imageBase64 = [Convert]::ToBase64String($imageBytes)
+    Write-DebugLog "Image Base64 length: $($imageBase64.Length) chars"
+    
+    $numCtx = if ([string]::IsNullOrWhiteSpace($bridgeSettings['NUM_CTX'])) { 2048 } else { [int]$bridgeSettings['NUM_CTX'] }
+    Write-DebugLog "Building API request with model: $model, num_ctx: $numCtx"
+    
     $body = @{
         model      = $model
         prompt     = $prompt
@@ -311,19 +500,74 @@ try {
         keep_alive = '10m'
         images     = @($imageBase64)
         options    = @{
-            num_ctx = if ([string]::IsNullOrWhiteSpace($bridgeSettings['NUM_CTX'])) { 2048 } else { [int]$bridgeSettings['NUM_CTX'] }
+            num_ctx = $numCtx
         }
     } | ConvertTo-Json -Depth 5 -Compress
+    Write-DebugLog "Request body size: $($body.Length) bytes"
 
-    $response = Invoke-RestMethod -Uri ($ollamaHost + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300
-    $text = [string]$response.response
+    Write-DebugLog "Calling Ollama API..."
+    try {
+        $response = Invoke-RestMethod -Uri ($ollamaHost + '/api/generate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 300 -ErrorAction Stop
+        Write-DebugLog "API call successful, response type: $($response.GetType().FullName)"
+    } catch {
+        Write-DebugLog "ERROR: API call failed: $_"
+        Write-EmptyOutput -Path $OutputFile
+        Write-Error "Ollama API call failed: $_"
+        exit 1
+    }
+    
+    if ($null -eq $response) {
+        Write-DebugLog "ERROR: API response is null"
+        Write-EmptyOutput -Path $OutputFile
+        Write-Error "Ollama API returned null response"
+        exit 1
+    }
+    
+    Write-DebugLog "Extracting response text..."
+    $text = $null
+    if ($null -ne $response) {
+        if ($response -is [string]) {
+            $text = $response.Trim()
+            Write-DebugLog "Response is string type: $($text.Length) chars"
+        } elseif ($null -ne $response.response) {
+            $text = [string]$response.response
+            Write-DebugLog "Response from .response property: $($text.Length) chars"
+        } else {
+            $text = [string]$response
+            Write-DebugLog "Response converted to string: $($text.Length) chars"
+        }
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        Write-DebugLog "ERROR: Empty response text after extraction"
+        Write-EmptyOutput -Path $OutputFile
+        Write-Error "Ollama model returned empty response"
+        exit 1
+    }
+    
     $text = $text -replace '[\r\n;]+', ', '
     $text = $text -replace '\s+', ' '
     $text = $text.Trim(' ', ',')
 
+    Write-DebugLog "Writing output to: $OutputFile"
     Set-Content -Path $OutputFile -Value $text -NoNewline
+    Write-DebugLog "Success! Keywords written."
     exit 0
 } catch {
+    Write-DebugLog "=== EXCEPTION CAUGHT ==="
+    Write-DebugLog "Error Type: $($_.Exception.GetType().FullName)"
+    Write-DebugLog "Error Message: $($_.Exception.Message)"
+    Write-DebugLog "Error Line: $($_.InvocationInfo.ScriptLineNumber)"
+    Write-DebugLog "Full Stack: $($_.Exception.ToString())"
+    Write-DebugLog ""
+    
     Write-EmptyOutput -Path $OutputFile
-    exit 0
+    
+    # Write error details to both stderr and the debug file
+    $errorMsg = "ERROR: $($_.Exception.Message)"
+    Write-Host $errorMsg -ForegroundColor Red -ErrorAction SilentlyContinue
+    Write-Host "Debug Log: $DebugFile" -ForegroundColor Yellow -ErrorAction SilentlyContinue
+    Write-DebugLog "Debug file written to: $DebugFile"
+    
+    exit 1
 }

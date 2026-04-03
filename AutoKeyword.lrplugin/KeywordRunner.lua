@@ -754,7 +754,18 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, aiSettings)
 
         for _, candidate in ipairs(candidates) do
             appendTextFile(debugFile, "COMMAND: " .. tostring(candidate) .. "\n")
+            
+            -- Show loading dialog while connecting to Ollama
+            local progressResult = LrProgressScope({
+                title = "Connecting to Ollama",
+                subtitle = "Please wait while AI keywords are being generated...",
+                cannotCancel = true,
+            })
+            
             exitCode = LrTasks.execute(candidate)
+            
+            progressResult:done()
+            
             appendTextFile(debugFile, "EXIT: " .. tostring(exitCode) .. "\n\n")
             if exitCode == 0 then
                 break
@@ -771,7 +782,12 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, aiSettings)
         deleteFile(historyFile)
         deleteFile(outputFile)
         deleteFile(settingsFile)
-        return {}, 'Local AI command failed with exit code ' .. tostring(exitCode) .. '. Debug log: ' .. tostring(debugFile)
+        local debugContent = readTextFile(debugFile)
+        local debugMsg = ''
+        if debugContent then
+            debugMsg = '\n\nDebug details:\n' .. debugContent
+        end
+        return {}, 'Local AI command failed with exit code ' .. tostring(exitCode) .. '. Debug log: ' .. tostring(debugFile) .. debugMsg
     end
 
     local outputText = readTextFile(outputFile)
@@ -782,8 +798,13 @@ function LocalAiSuggester.suggest(photoOrPath, historyText, aiSettings)
     deleteFile(settingsFile)
 
     if clean(outputText) == nil then
-        deleteFile(debugFile)
-        return {}, buildLocalAiNoOutputMessage()
+        local debugContent = readTextFile(debugFile)
+        local debugMsg = ''
+        if debugContent then
+            debugMsg = '\n\nDebug details:\n' .. debugContent
+        end
+        -- Keep debug file for inspection if command succeeded but produced no output
+        return {}, 'Local AI command succeeded but returned no keywords.' .. debugMsg
     end
 
     local parsed = parseAiKeywordOutput(outputText)

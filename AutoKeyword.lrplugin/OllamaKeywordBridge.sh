@@ -14,7 +14,7 @@ CPU_ONLY=""
 EXISTING_KEYWORDS=""
 NUM_CTX="2048"
 KEEP_ALIVE="10m"
-PID_FILE="${TMPDIR:-/tmp}/lrkw_ollama_started_by_plugin.pid"
+PID_FILE="/tmp/lrkw_ollama_started_by_plugin.pid"
 
 if [[ "$OLLAMA_HOST_VALUE" != http://* && "$OLLAMA_HOST_VALUE" != https://* ]]; then
   OLLAMA_HOST_VALUE="http://${OLLAMA_HOST_VALUE}"
@@ -23,7 +23,8 @@ OLLAMA_HOST_VALUE="${OLLAMA_HOST_VALUE%/}"
 
 if [[ -z "$IMAGE_PATH" || -z "$OUTPUT_FILE" ]]; then
   echo "" > "${OUTPUT_FILE:-/tmp/lrkw_empty.txt}"
-  exit 0
+  echo "ERROR: Missing required arguments (IMAGE_PATH and OUTPUT_FILE)" >&2
+  exit 1
 fi
 
 install_ollama() {
@@ -37,6 +38,83 @@ record_started_pid() {
   [[ -n "$pid" ]] || return 0
   started_at="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
   printf '%s|%s\n' "$pid" "$started_at" > "$PID_FILE"
+}
+
+find_running_ollama_pid() {
+  pgrep -f "ollama serve" 2>/dev/null | head -n 1
+}
+
+find_lightroom_pid() {
+  local current="$$"
+  local name=""
+  local parent=""
+
+  for _ in {1..12}; do
+    [[ -n "$current" && "$current" != "0" ]] || break
+    name="$(ps -p "$current" -o comm= 2>/dev/null | sed 's/^ *//')"
+    case "$name" in
+      *Lightroom*|*lightroom*)
+        printf '%s\n' "$current"
+        return 0
+        ;;
+    esac
+
+    parent="$(ps -p "$current" -o ppid= 2>/dev/null | tr -d '[:space:]')"
+    current="$parent"
+  done
+
+  return 1
+}
+
+launch_watchdog() {
+  local lightroom_pid="$1"
+  local ollama_pid="$2"
+  local expected_start="$3"
+
+  [[ -n "$lightroom_pid" && -n "$ollama_pid" ]] || return 0
+
+  nohup /bin/sh -c '
+    LR_PID="$1"
+    OLLAMA_PID="$2"
+    EXPECTED_START="$3"
+    PID_FILE="$4"
+    i=0
+    while [ "$i" -lt 1800 ]; do
+      kill -0 "$LR_PID" >/dev/null 2>&1 || break
+      sleep 2
+      i=$((i + 1))
+    done
+
+    if kill -0 "$OLLAMA_PID" >/dev/null 2>&1; then
+      CURRENT_COMMAND="$(ps -p "$OLLAMA_PID" -o command= 2>/dev/null)"
+      CURRENT_START="$(ps -p "$OLLAMA_PID" -o lstart= 2>/dev/null | sed '"'"'s/^ *//'"'"')"
+      case "$CURRENT_COMMAND" in
+        *"ollama serve"*)
+          if [ -z "$EXPECTED_START" ] || [ "$CURRENT_START" = "$EXPECTED_START" ]; then
+            kill "$OLLAMA_PID" >/dev/null 2>&1 || true
+            sleep 1
+            kill -0 "$OLLAMA_PID" >/dev/null 2>&1 && kill -9 "$OLLAMA_PID" >/dev/null 2>&1 || true
+          fi
+          ;;
+      esac
+    fi
+
+    rm -f "$PID_FILE"
+  ' sh "$lightroom_pid" "$ollama_pid" "$expected_start" "$PID_FILE" >/dev/null 2>&1 &
+}
+
+adopt_running_ollama_for_session() {
+  local ollama_pid=""
+  local started_at=""
+  local lightroom_pid=""
+
+  ollama_pid="$(find_running_ollama_pid || true)"
+  [[ -n "$ollama_pid" ]] || return 0
+
+  started_at="$(ps -p "$ollama_pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
+  printf '%s|%s\n' "$ollama_pid" "$started_at" > "$PID_FILE"
+  lightroom_pid="$(find_lightroom_pid || true)"
+  launch_watchdog "$lightroom_pid" "$ollama_pid" "$started_at"
 }
 
 json_escape() {
@@ -83,7 +161,12 @@ fi
 
 if [[ -z "$OLLAMA_BIN" ]]; then
   echo "" > "$OUTPUT_FILE"
-  exit 0
+  echo "ERROR: Ollama binary not found. Download from https://ollama.ai" >&2
+  exit 1
+fi
+
+if curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
+  adopt_running_ollama_for_session
 fi
 
 if ! curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
@@ -92,9 +175,13 @@ if ! curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
   else
     nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
   fi
-  record_started_pid "$!"
+  OLLAMA_STARTED_PID="$!"
+  record_started_pid "$OLLAMA_STARTED_PID"
+  OLLAMA_STARTED_AT="$(ps -p "$OLLAMA_STARTED_PID" -o lstart= 2>/dev/null | sed 's/^ *//')"
+  LIGHTROOM_PID="$(find_lightroom_pid || true)"
+  launch_watchdog "$LIGHTROOM_PID" "$OLLAMA_STARTED_PID" "$OLLAMA_STARTED_AT"
 
-  for _ in {1..60}; do
+  for _ in {1..180}; do
     if curl -fsS "${OLLAMA_HOST_VALUE}/api/tags" >/dev/null 2>&1; then
       break
     fi
@@ -113,6 +200,13 @@ if ! "$OLLAMA_BIN" show "$MODEL" >/dev/null 2>&1; then
       break
     fi
   done
+fi
+
+# Verify we have a valid model
+if ! "$OLLAMA_BIN" show "$MODEL" >/dev/null 2>&1; then
+  echo "" > "$OUTPUT_FILE"
+  echo "ERROR: No valid Ollama model found. Tried: $MODEL, llava:latest, llava:7b, gemma3:4b" >&2
+  exit 1
 fi
 
 HISTORY_TEXT=""
@@ -143,8 +237,10 @@ RAW_OUTPUT="$(curl -fsS "${OLLAMA_HOST_VALUE}/api/generate" -H 'Content-Type: ap
 RESPONSE_TEXT="$(printf '%s' "$RAW_OUTPUT" | sed -n 's/.*"response":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\n/, /g; s/\\r//g; s/[[:space:]]\+/ /g; s/^,*//; s/,*$//')"
 
 if [[ -z "$RESPONSE_TEXT" ]]; then
+  echo "ERROR: Ollama model returned empty response" >&2
   echo "" > "$OUTPUT_FILE"
-  exit 0
+  exit 1
 fi
 
 echo "$RESPONSE_TEXT" > "$OUTPUT_FILE"
+exit 0
