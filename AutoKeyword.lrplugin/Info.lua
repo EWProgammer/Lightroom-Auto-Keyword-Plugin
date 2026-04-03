@@ -26,6 +26,12 @@ local menuItems = {
         title = "Local AI Settings...",
         file = "LocalAiRuntimeManager.lua",
     },
+
+    -- Utility menu item: Remove leftover temporary JPEG previews from the system temp folder
+    {
+        title = "Purge JPEG Previews...",
+        file = "PurgeJpegPreviews.lua",
+    },
     
     -- Utility menu item: Check GitHub for plugin updates
     {
